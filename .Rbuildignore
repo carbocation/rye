@@ -6,5 +6,6 @@
 ^logo$
 ^tests/benchmark_native_optimizer\.R$
 ^tests/verify_native_solver\.R$
+^tests/verify_cli_parity\.R$
 ^rye_[0-9.]+\.tar\.gz$
 ^rye\.Rcheck$

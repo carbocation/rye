@@ -9,6 +9,35 @@ Testers: Lavanya Rishishwar, Shivam Sharma, Emily Norris, Maria Ahmad
 
 ## Installation
 
+### Install the standalone Rust binary
+
+The standalone `rye` executable runs the complete workflow without R. Install
+it directly from GitHub with Cargo:
+
+```sh
+cargo install --locked --git https://github.com/carbocation/rye rye-cli
+rye --help
+```
+
+This requires Rust 1.85 or newer. Cargo installs the executable as `rye` under
+its normal binary directory (usually `~/.cargo/bin`), which should be on
+`PATH`. From a source checkout, the equivalent local installation is:
+
+```sh
+cargo install --locked --path crates/rye-cli
+```
+
+Or build without installing it:
+
+```sh
+cargo build --release --package rye-cli
+./target/release/rye --help
+```
+
+The standalone binary has no R dependency. It reads the same eigenvector,
+eigenvalue, and population-mapping files and accepts the same computational
+options as `rye.R`.
+
 ### Install as an R package
 
 Rye can be installed directly from GitHub with `remotes`. The installer builds
@@ -72,12 +101,13 @@ git clone https://github.com/carbocation/rye
 
 cd rye
 
-# Build the single-thread-optimized Rust solver and R adapter
+# Build the standalone binary and R adapter
 # Cargo fetches the published rng-compat-r and its pinned libm dependency.
 cargo build --release
 
 # Check if the install happened correctly
 ./rye.R -h
+./target/release/rye --help
 ```
 
 If Rust is unavailable, install `nnls` with `Rscript -e 'install.packages("nnls")'` and Rye will automatically use its R/Fortran compatibility path.
@@ -88,7 +118,7 @@ The Rust solver moves each complete Gibbs attempt across a single R/native bound
 
 Rye transfers `.Random.seed` into Rust once per attempt. The published `rng-compat-r` crate then performs R-compatible index sampling, normal generation, acceptance probabilities, and final state serialization without calling back into R for each proposal. Mersenne Twister and L'Ecuyer-CMRG are accelerated; unsupported R generator configurations automatically use the R-orchestrated compatibility path without consuming state during the failed native attempt.
 
-The native solver does not create worker threads, so `--threads=1` receives the full SIMD and algorithmic speedup. When more threads are requested on macOS or Linux, Rye retains its outer process-level parallelism across independent attempts and avoids nested oversubscription. Pass `--seed=<integer>` (or `seed = <integer>` through the R API) for exact repeatability. Rye assigns an R-compatible L'Ecuyer stream to every logical round and attempt before launching workers, so results do not change when `--threads` changes. A preceding `set.seed()` is also respected when the explicit seed is omitted.
+Each Gibbs attempt remains single-threaded, so `--threads=1` receives the full SIMD and algorithmic speedup without hidden parallelism. The standalone binary uses a persistent native thread pool across independent attempts when more workers are requested; the R package retains process-level parallelism on macOS and Linux. Both avoid nested oversubscription. Pass `--seed=<integer>` (or `seed = <integer>` through the R API) for exact repeatability. Rye assigns an R-compatible L'Ecuyer stream to every logical round and attempt before launching workers, so results do not change when `--threads` changes. A preceding `set.seed()` is also respected by the R package when the explicit seed is omitted.
 
 On the bundled 3,400-sample example, an isolated 500-proposal, one-thread optimizer benchmark improved from 8.701 seconds on the R/Fortran compatibility solver to 0.090 seconds with the persistent Rust optimizer (96.7x), with maximum prediction drift below `4e-11`. Removing the remaining per-proposal R RNG/math callbacks reduced a matched 20,000-proposal run from 2.234 to 2.202 seconds on the ARM64/NEON development machine. Mask-batched NNLS and a vectorized objective then reduced the same run to 0.720 seconds (36.0 microseconds per proposal), a further 3.06x single-thread speedup. The full default 49,600-proposal run completed in 8.20 seconds before the mask-batched optimization. AVX2 and AVX-512 kernels are compile-checked and selected automatically on supported x86-64 systems.
 
@@ -98,6 +128,12 @@ Re-run the isolated optimizer benchmark with `Rscript tests/benchmark_native_opt
 
 ## Quickstart guide
 Example files are provided to help user understand the input and test Rye easily.  If the environment is setup correctly, the user should be able to run the following command to run Rye:
+
+```
+rye --eigenvec=examples/example.eigenvec --eigenval=examples/example.eigenval --pop2group=examples/pop2group.txt --rounds=5 --threads=2 --iter=5 --output=out
+```
+
+The R command-line wrapper remains available and accepts the same options:
 
 ```
 ./rye.R --eigenvec=examples/example.eigenvec --eigenval=examples/example.eigenval --pop2group=examples/pop2group.txt --rounds=5 --threads=2 --iter=5 --output=out
@@ -160,7 +196,7 @@ These steps are described in more details in the following sections
 
 ### General usage of Rye
 ```
-Usage: ./rye.R [options]
+Usage: rye [options]
 
 
 Options:

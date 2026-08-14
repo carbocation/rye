@@ -18,6 +18,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rye-cli"
+version = "0.1.0"
+dependencies = [
+ "rye-core",
+]
+
+[[package]]
 name = "rye-core"
 version = "0.1.0"
 dependencies = [

@@ -1,4 +1,5 @@
 mod nnls;
+mod orchestrator;
 mod simd;
 
 use nnls::{BatchWorkspace, solve_nnls_batch};
@@ -8,10 +9,14 @@ use simd::{AxpyKernel, select_axpy, select_prediction_error};
 use std::fmt;
 use std::mem;
 
+pub use orchestrator::{OptimizeInput, OptimizeResult, RoundProgress, optimize_rounds};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreError {
     InvalidDimensions(&'static str),
     UnsupportedRandomSeed,
+    WorkerDisconnected,
+    WorkerPanicked,
 }
 
 impl fmt::Display for CoreError {
@@ -19,6 +24,8 @@ impl fmt::Display for CoreError {
         match self {
             Self::InvalidDimensions(message) => formatter.write_str(message),
             Self::UnsupportedRandomSeed => formatter.write_str("unsupported R random seed"),
+            Self::WorkerDisconnected => formatter.write_str("optimizer worker disconnected"),
+            Self::WorkerPanicked => formatter.write_str("optimizer worker panicked"),
         }
     }
 }
@@ -59,6 +66,7 @@ pub struct GibbsInput<'a> {
     pub random_seed: &'a [i32],
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct GibbsResult {
     pub best_error: f64,
     pub alpha: Vec<f64>,
@@ -71,6 +79,13 @@ pub struct GibbsResult {
 }
 
 pub const LECUYER_RANDOM_SEED_LEN: usize = 7;
+
+/// Reproduce `RNGkind("L'Ecuyer-CMRG"); set.seed(seed)` without embedding R.
+pub fn lecuyer_seed(seed: i32) -> Result<Vec<i32>, CoreError> {
+    let rng = RRng::try_from_seed_with_kind(seed, rng_compat_r::RUniformKind::LecuyerCmrg)
+        .map_err(|_| CoreError::UnsupportedRandomSeed)?;
+    Ok(rng.random_seed())
+}
 
 /// Derive deterministic, non-overlapping R-compatible worker streams.
 ///

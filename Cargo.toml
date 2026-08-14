@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/rye-core", "crates/rye-r"]
-default-members = ["crates/rye-r"]
+members = ["crates/rye-cli", "crates/rye-core", "crates/rye-r"]
+default-members = ["crates/rye-cli", "crates/rye-r"]
 
 [profile.release]
 codegen-units = 1

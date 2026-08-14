@@ -1,0 +1,13 @@
+[package]
+name = "rye-cli"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[[bin]]
+name = "rye"
+path = "src/main.rs"
+
+[dependencies]
+rye-core = { path = "../rye-core" }
