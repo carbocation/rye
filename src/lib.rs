@@ -1,9 +1,9 @@
 mod nnls;
 mod simd;
 
-use nnls::{FactorCache, solve_nnls};
+use nnls::{BatchWorkspace, solve_nnls_batch};
 use rng_compat_r::{MathMode, RRng, pnorm_with_mode};
-use simd::{AxpyKernel, select_axpy};
+use simd::{AxpyKernel, select_axpy, select_prediction_error};
 use std::ffi::{c_int, c_void};
 use std::mem;
 use std::slice;
@@ -28,26 +28,6 @@ unsafe extern "C" {
     fn Rf_xlength(value: Sexp) -> isize;
     fn REAL(value: Sexp) -> *mut f64;
     fn SET_VECTOR_ELT(vector: Sexp, index: isize, value: Sexp);
-}
-
-struct SolverWorkspace {
-    rhs: Vec<f64>,
-    warm: Vec<f64>,
-    solution: Vec<f64>,
-    candidate: Vec<f64>,
-    factors: FactorCache,
-}
-
-impl SolverWorkspace {
-    fn new(groups: usize) -> Self {
-        Self {
-            rhs: vec![0.0; groups],
-            warm: vec![0.0; groups],
-            solution: vec![0.0; groups],
-            candidate: vec![0.0; groups],
-            factors: FactorCache::new(groups),
-        }
-    }
 }
 
 #[inline]
@@ -163,48 +143,24 @@ fn solve_all(
     gram: &[f64],
     rhs: &[f64],
     warm: &[f64],
+    warm_masks: Option<&[u64]>,
     samples: usize,
     groups: usize,
     output: &mut [f64],
-    workspace: &mut SolverWorkspace,
+    output_masks: &mut [u64],
+    workspace: &mut BatchWorkspace,
 ) {
-    workspace.factors.clear();
-    for sample in 0..samples {
-        for group in 0..groups {
-            workspace.rhs[group] = rhs[group * samples + sample];
-            workspace.warm[group] = warm[group * samples + sample];
-        }
-        solve_nnls(
-            gram,
-            &workspace.rhs,
-            &workspace.warm,
-            &mut workspace.solution,
-            &mut workspace.candidate,
-            &mut workspace.factors,
-        );
-        for group in 0..groups {
-            output[group * samples + sample] = workspace.solution[group];
-        }
-    }
-}
-
-fn prediction_error(
-    coefficients: &[f64],
-    target_group: &[usize],
-    sample_weight: &[f64],
-    samples: usize,
-    groups: usize,
-) -> f64 {
-    let mut error = 0.0;
-    for sample in 0..samples {
-        let mut total = 0.0;
-        for group in 0..groups {
-            total += coefficients[group * samples + sample];
-        }
-        let target = coefficients[target_group[sample] * samples + sample] / total;
-        error += sample_weight[sample] * (2.0 * (1.0 - target) / groups as f64);
-    }
-    error
+    solve_nnls_batch(
+        gram,
+        rhs,
+        warm,
+        warm_masks,
+        samples,
+        groups,
+        output,
+        output_masks,
+        workspace,
+    );
 }
 
 fn copy_normalized(coefficients: &[f64], samples: usize, groups: usize, output: &mut [f64]) {
@@ -279,14 +235,17 @@ pub unsafe extern "C" fn rye_nnls_batch(
         select_axpy(),
     );
     let zero_warm = vec![0.0; samples * groups];
+    let mut output_masks = vec![0_u64; samples];
     solve_all(
         &gram,
         &rhs,
         if warm.is_empty() { &zero_warm } else { warm },
+        None,
         samples,
         groups,
         result,
-        &mut SolverWorkspace::new(groups),
+        &mut output_masks,
+        &mut BatchWorkspace::new(groups, samples),
     );
     unsafe { Rf_unprotect(1) };
     answer
@@ -358,6 +317,7 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
         .map(|&value| value as usize)
         .collect();
     let axpy = select_axpy();
+    let prediction_error = select_prediction_error();
 
     let mut current_alpha = alpha_input.to_vec();
     let mut current_weight = weight_input.to_vec();
@@ -385,15 +345,18 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
         &mut current_rhs,
         axpy,
     );
-    let mut workspace = SolverWorkspace::new(groups);
+    let mut workspace = BatchWorkspace::new(groups, samples);
     let zero_warm = vec![0.0; samples * groups];
+    let mut current_masks = vec![0_u64; samples];
     solve_all(
         &current_gram,
         &current_rhs,
         &zero_warm,
+        None,
         samples,
         groups,
         &mut current_coefficients,
+        &mut current_masks,
         &mut workspace,
     );
     let mut current_error = prediction_error(
@@ -418,6 +381,7 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
     let mut proposal_gram = current_gram.clone();
     let mut proposal_rhs = current_rhs.clone();
     let mut proposal_coefficients = current_coefficients.clone();
+    let mut proposal_masks = current_masks.clone();
 
     for _ in 0..iterations {
         proposal_alpha.clone_from_slice(&current_alpha);
@@ -484,9 +448,11 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
             &proposal_gram,
             &proposal_rhs,
             &current_coefficients,
+            Some(&current_masks),
             samples,
             groups,
             &mut proposal_coefficients,
+            &mut proposal_masks,
             &mut workspace,
         );
         let proposal_error = prediction_error(
@@ -528,6 +494,7 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
             mem::swap(&mut current_gram, &mut proposal_gram);
             mem::swap(&mut current_rhs, &mut proposal_rhs);
             mem::swap(&mut current_coefficients, &mut proposal_coefficients);
+            mem::swap(&mut current_masks, &mut proposal_masks);
         }
     }
 
