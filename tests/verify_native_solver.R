@@ -50,6 +50,26 @@ for (row in seq_len(min(100, nrow(referenceX)))) {
   stopifnot(all(abs(gradient[coefficients > 0]) < 1e-8))
 }
 
+## The persistent native Gibbs loop must track the R-orchestrated loop under
+## identical RNG state while avoiding per-proposal R allocations.
+set.seed(123)
+nativeOptimizer = rye.gibbs(
+  referenceX, referenceFam, referenceGroups,
+  alpha, TRUE, weight, TRUE, iterations = 500, sd = 0.01
+)
+rye.nativeOptimizer = FALSE
+set.seed(123)
+rOptimizer = rye.gibbs(
+  referenceX, referenceFam, referenceGroups,
+  alpha, TRUE, weight, TRUE, iterations = 500, sd = 0.01
+)
+stopifnot(abs(nativeOptimizer[[1]] - rOptimizer[[1]]) < 1e-9)
+stopifnot(max(abs(nativeOptimizer[[2]] - rOptimizer[[2]])) < 1e-12)
+stopifnot(max(abs(nativeOptimizer[[3]] - rOptimizer[[3]])) < 1e-12)
+stopifnot(max(abs(nativeOptimizer[[4]] - rOptimizer[[4]])) < 1e-9)
+stopifnot(max(abs(nativeOptimizer[[5]] - rOptimizer[[5]])) < 1e-8)
+rye.nativeOptimizer = TRUE
+
 ## When nnls is installed, check numerical parity with Rye's compatibility path.
 if (requireNamespace('nnls', quietly = TRUE)) {
   nativePredictions = rye.predict(referenceX, means, weight)

@@ -22,6 +22,8 @@ for(p in requiredPackages){
 ## Load the optional Rust batch solver. The original nnls implementation is
 ## retained as a fallback so existing installations continue to work.
 rye.nativeSolver = FALSE
+rye.nativeOptimizer = FALSE
+rye.nativeKernel = 'scalar'
 rye.nativeLibrary = switch(
   .Platform$OS.type,
   windows = 'rye_core.dll',
@@ -39,6 +41,13 @@ nativeLibraryPaths = unique(file.path(
 for (nativeLibraryPath in nativeLibraryPaths[file.exists(nativeLibraryPaths)]) {
   rye.nativeSolver = !inherits(try(dyn.load(nativeLibraryPath), silent = TRUE), 'try-error')
   if (rye.nativeSolver) break
+}
+if (rye.nativeSolver) {
+  nativeLevel = try(.Call('rye_simd_level'), silent = TRUE)
+  if (!inherits(nativeLevel, 'try-error')) {
+    rye.nativeOptimizer = TRUE
+    rye.nativeKernel = c('scalar', 'NEON', 'AVX2', 'AVX-512')[[nativeLevel + 1]]
+  }
 }
 if (!rye.nativeSolver && !suppressMessages(require('nnls', character.only = TRUE, quietly = TRUE))) {
   stop(paste0(
@@ -144,6 +153,10 @@ rye.predict = function(X = NULL, means = NULL, weight = NULL, referenceGroups = 
   if (!is.null(referenceGroups)) {
     groups = unique(referenceGroups)
     populationGroups = unname(referenceGroups[colnames(estimates)])
+    if (length(groups) == ncol(estimates) &&
+        identical(as.character(populationGroups), colnames(estimates))) {
+      return(estimates)
+    }
     groupIndex = match(populationGroups, groups)
     membership = matrix(0, nrow = ncol(estimates), ncol = length(groups))
     membership[cbind(seq_len(nrow(membership)), groupIndex)] = 1
@@ -161,10 +174,57 @@ rye.absoluteError = function(expected = NULL, predicted = NULL) {
   return(abs(expected - predicted))
 }
 
+rye.gibbsNative = function(X, fam, baseMeans, pops,
+                           alpha, weight, iterations, sd,
+                           optimizeAlpha, optimizeWeight, sampleWeight) {
+  baseIndex = match(pops, rownames(baseMeans))
+  targetGroup = match(fam[ , 'group'], pops)
+  if (anyNA(baseIndex) || anyNA(targetGroup)) {
+    return(NULL)
+  }
+  orderedMeans = baseMeans[pops, , drop = FALSE]
+  if (!is.double(X)) storage.mode(X) = 'double'
+  if (!is.double(orderedMeans)) storage.mode(orderedMeans) = 'double'
+  result = .Call(
+    'rye_gibbs_native',
+    X,
+    orderedMeans,
+    as.numeric(alpha),
+    as.numeric(weight),
+    as.numeric(baseIndex - 1),
+    as.numeric(targetGroup - 1),
+    as.numeric(sampleWeight),
+    c(iterations, sd, optimizeAlpha, optimizeWeight)
+  )
+
+  groups = length(pops)
+  features = ncol(X)
+  samples = nrow(X)
+  offset = 1
+  minError = result[[offset]]
+  offset = offset + 1
+  bestAlpha = setNames(result[offset:(offset + groups - 1)], pops)
+  offset = offset + groups
+  bestWeight = result[offset:(offset + features - 1)]
+  offset = offset + features
+  bestMeans = matrix(
+    result[offset:(offset + groups * features - 1)],
+    nrow = groups, ncol = features,
+    dimnames = list(pops, colnames(X))
+  )
+  offset = offset + groups * features
+  bestPredicted = matrix(
+    result[offset:(offset + samples * groups - 1)],
+    nrow = samples, ncol = groups,
+    dimnames = list(rownames(X), pops)
+  )
+  return(list(minError, bestAlpha, bestWeight, bestMeans, bestPredicted))
+}
+
 rye.gibbs = function(X = NULL, fam = NULL, referenceGroups = NULL, 
                      alpha = NULL, optimizeAlpha = TRUE,
                      weight = NULL, optimizeWeight = TRUE,
-                     iterations = 100, sd = 0.0001) {
+                     iterations = 100, sd = 0.0001, baseMeans = NULL) {
   
   pops = names(alpha)
   
@@ -179,14 +239,29 @@ rye.gibbs = function(X = NULL, fam = NULL, referenceGroups = NULL,
 
   ## Population membership and raw medians do not change during optimization.
   ## The historical implementation recomputed both for every proposal.
-  baseMeans = rye.basePopulationMeans(
-    X = X, fam = fam, referenceGroups = referenceGroups
-  )
+  if (is.null(baseMeans)) {
+    baseMeans = rye.basePopulationMeans(
+      X = X, fam = fam, referenceGroups = referenceGroups
+    )
+  }
 
   predictionGroups = unique(referenceGroups)
   targetColumn = match(fam[ , 'group'], predictionGroups)
   groupCounts = table(fam[ , 'group'])
   sampleWeight = 1 / (length(groupCounts) * as.numeric(groupCounts[fam[ , 'group']]))
+
+  identityGroups = length(referenceGroups) == length(pops) &&
+    !anyNA(referenceGroups[pops]) &&
+    identical(as.character(unname(referenceGroups[pops])), pops)
+  if (rye.nativeOptimizer && identityGroups) {
+    nativeResult = rye.gibbsNative(
+      X, fam, baseMeans, pops,
+      alpha, weight, iterations, sd,
+      optimizeAlpha, optimizeWeight, sampleWeight
+    )
+    if (!is.null(nativeResult)) return(nativeResult)
+  }
+
   predictionError = function(predicted) {
     targetProbability = predicted[cbind(seq_len(nrow(predicted)), targetColumn)]
     sum(sampleWeight * (2 * (1 - targetProbability) / ncol(predicted)))
@@ -211,14 +286,14 @@ rye.gibbs = function(X = NULL, fam = NULL, referenceGroups = NULL,
     ## Pick new alpha and weight for this iteration
     newAlpha = alpha
     if (optimizeAlpha) {
-      toUpdate = sample(seq(length(newAlpha)))[1]
+      toUpdate = sample.int(length(newAlpha), 1)
       newAlpha[toUpdate] = newAlpha[toUpdate] + rnorm(n = 1, sd = (abs(newAlpha[toUpdate]) + 0.001) * sd) + alphaMomentum[toUpdate]
       newAlpha[newAlpha < 0] = 0
     }
     
     newWeight = weight
     if (optimizeWeight) {
-      toUpdate = sample(seq(length(newWeight)))[1]
+      toUpdate = sample.int(length(newWeight), 1)
       newWeight[toUpdate] = newWeight[toUpdate] + rnorm(n = 1, sd = (newWeight[toUpdate] + 0.001) * sd) + weightMomentum[toUpdate]
       newWeight[newWeight < 0] = 0
     }
@@ -280,6 +355,9 @@ rye.optimize = function(X = NULL, fam = NULL,
   }
   
   allErrors = c()
+  baseMeans = rye.basePopulationMeans(
+    X = referenceX, fam = referenceFAM, referenceGroups = referenceGroups
+  )
   
   for (round in seq(rounds)) {
     
@@ -288,12 +366,14 @@ rye.optimize = function(X = NULL, fam = NULL,
       params = mclapply(seq(attempts), function(i) rye.gibbs(X = referenceX, fam = referenceFAM, referenceGroups = referenceGroups,
                                                             iterations = iterations,
                                                             alpha = alpha, weight = weight, sd = sd,
-                                                            optimizeAlpha = optimizeAlpha, optimizeWeight = optimizeWeight), mc.cores = threads)
+                                                            optimizeAlpha = optimizeAlpha, optimizeWeight = optimizeWeight,
+                                                            baseMeans = baseMeans), mc.cores = threads)
     } else {
       params = lapply(seq(attempts), function(i) rye.gibbs(X = referenceX, fam = referenceFAM, referenceGroups = referenceGroups,
                                                           iterations = iterations,
                                                           alpha = alpha, weight = weight, sd = sd,
-                                                          optimizeAlpha = optimizeAlpha, optimizeWeight = optimizeWeight))
+                                                          optimizeAlpha = optimizeAlpha, optimizeWeight = optimizeWeight,
+                                                          baseMeans = baseMeans))
     } 
     
     
@@ -483,7 +563,13 @@ rye.main = function(args = commandArgs(trailingOnly = TRUE)) {
   logmsg("Parsing user supplied arguments...")
   validate_arguments(opt)
   logmsg("Arguments passed validation")
-  solver = if (rye.nativeSolver) "Rust-accelerated" else "R/Fortran"
+  solver = if (rye.nativeOptimizer) {
+    paste("Rust-accelerated", rye.nativeKernel)
+  } else if (rye.nativeSolver) {
+    "Rust-accelerated"
+  } else {
+    "R/Fortran"
+  }
   logmsg(paste0("Running core rye with ", opt$threads, " threads (", solver, " solver)"))
   rye(eigenvec_file = opt$eigenvec,
       eigenval_file = opt$eigenval,
