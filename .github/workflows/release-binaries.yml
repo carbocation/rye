@@ -1,0 +1,184 @@
+name: Release binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64 (static musl)
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            artifact: rye-linux-x86_64-static
+            linkage: static
+            architecture: x86-64
+            deployment_target: ""
+          - name: Linux ARM64 (static musl)
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact: rye-linux-aarch64-static
+            linkage: static
+            architecture: ARM aarch64
+            deployment_target: ""
+          - name: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+            artifact: rye-macos-aarch64
+            linkage: macos
+            architecture: arm64
+            deployment_target: "11.0"
+          - name: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: rye-macos-x86_64
+            linkage: macos
+            architecture: x86_64
+            deployment_target: "10.13"
+
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      ARTIFACT: ${{ matrix.artifact }}
+      EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Test workspace
+        run: cargo test --locked --workspace
+
+      - name: Build executable
+        run: cargo build --locked --release --package rye-cli --target "$TARGET"
+
+      - name: Verify architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/rye"
+          file "$binary"
+          file "$binary" | grep -q "$EXPECTED_ARCHITECTURE"
+
+      - name: Verify static Linux linkage
+        if: matrix.linkage == 'static'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/rye"
+          file "$binary" | grep -Eq "statically linked|static-pie linked"
+          if readelf --program-headers "$binary" | grep -q "Requesting program interpreter"; then
+            echo "error: static binary unexpectedly has a program interpreter" >&2
+            exit 1
+          fi
+          if readelf --dynamic "$binary" 2>&1 | grep -q "(NEEDED)"; then
+            echo "error: static binary unexpectedly has shared-library dependencies" >&2
+            exit 1
+          fi
+
+      - name: Verify macOS linkage
+        if: matrix.linkage == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/rye"
+          dependencies="$(otool -L "$binary")"
+          printf '%s\n' "$dependencies"
+          unexpected="$(
+            printf '%s\n' "$dependencies" |
+              tail -n +2 |
+              awk '{print $1}' |
+              grep -Ev '^/usr/lib/libSystem[.]B[.]dylib$' || true
+          )"
+          if [[ -n "$unexpected" ]]; then
+            echo "error: standalone binary has unexpected runtime dependencies:" >&2
+            printf '%s\n' "$unexpected" >&2
+            exit 1
+          fi
+
+      - name: Verify seeded thread-count reproducibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/rye"
+          "$binary" --version
+          output_directory="$(mktemp -d)"
+          trap 'rm -rf "$output_directory"' EXIT
+          common=(
+            "--eigenvec=examples/example.eigenvec"
+            "--eigenval=examples/example.eigenval"
+            "--pop2group=examples/pop2group.txt"
+            "--rounds=3"
+            "--iter=20"
+            "--attempts=4"
+            "--seed=2026"
+          )
+          "$binary" "${common[@]}" --threads=1 "--output=$output_directory/serial"
+          "$binary" "${common[@]}" --threads=4 "--output=$output_directory/parallel"
+          cmp "$output_directory/serial-20.7.Q" "$output_directory/parallel-20.7.Q"
+          cmp "$output_directory/serial-20.fam" "$output_directory/parallel-20.fam"
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          cp "target/$TARGET/release/rye" dist/package/rye
+          archive="$PWD/dist/$ARTIFACT.tar.gz"
+          tar -C dist/package -czf "$archive" rye
+          cd dist
+          shasum -a 256 "$ARTIFACT.tar.gz" > "$ARTIFACT.tar.gz.sha256"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Attach binaries to tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rye-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi

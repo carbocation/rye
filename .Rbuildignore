@@ -1,6 +1,7 @@
 ^\.git$
 ^\.github$
 ^target$
+^dist$
 ^Cargo\.toml\.orig$
 ^examples$
 ^logo$

@@ -38,6 +38,47 @@ The standalone binary has no R dependency. It reads the same eigenvector,
 eigenvalue, and population-mapping files and accepts the same computational
 options as `rye.R`.
 
+#### Prebuilt standalone binaries
+
+The `Release binaries` workflow produces these checksummed archives:
+
+| Archive | Platform | Linkage |
+| --- | --- | --- |
+| `rye-linux-x86_64-static.tar.gz` | Linux x86-64 | Fully static musl |
+| `rye-linux-aarch64-static.tar.gz` | Linux ARM64 | Fully static musl |
+| `rye-macos-aarch64.tar.gz` | macOS Apple Silicon | macOS `libSystem` only; no R |
+| `rye-macos-x86_64.tar.gz` | macOS Intel | macOS `libSystem` only; no R |
+
+GitHub Actions stores all four as workflow artifacts. A tag beginning with `v`
+also creates or updates the corresponding GitHub release and attaches the
+archives and SHA-256 checksum files.
+
+Linux supports genuinely static executables. macOS does not support fully
+static normal executables, so the two Mac builds retain the mandatory system
+library linkage while having no R or third-party runtime dependency.
+
+To build the static Linux x86-64 artifact locally on an x86-64 Linux host:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --locked --release --package rye-cli \
+  --target x86_64-unknown-linux-musl
+file target/x86_64-unknown-linux-musl/release/rye
+```
+
+The result is `target/x86_64-unknown-linux-musl/release/rye`. It targets the
+baseline x86-64 instruction set and selects AVX2 or AVX-512 kernels at runtime,
+so one artifact can run across a range of x86-64 machines. The ARM64 artifact
+uses NEON. The workflow checks each file's architecture, rejects an ELF
+interpreter or shared-library dependency in both Linux builds, rejects R
+linkage in both Mac builds, and runs each executable before packaging it.
+
+An explicit `--seed` deterministically assigns an R-compatible L'Ecuyer stream
+to each logical attempt before scheduling begins. Results are therefore
+independent of worker completion order and `--threads` on the same executable.
+Set `RYE_DETERMINISTIC_MATH=1` when reproducibility must also extend across
+platform math-library implementations.
+
 ### Install as an R package
 
 Rye can be installed directly from GitHub with `remotes`. The installer builds
