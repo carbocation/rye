@@ -57,18 +57,134 @@ nativeOptimizer = rye.gibbs(
   referenceX, referenceFam, referenceGroups,
   alpha, TRUE, weight, TRUE, iterations = 500, sd = 0.01
 )
+nativeSeed = .Random.seed
 rye.nativeOptimizer = FALSE
 set.seed(123)
 rOptimizer = rye.gibbs(
   referenceX, referenceFam, referenceGroups,
   alpha, TRUE, weight, TRUE, iterations = 500, sd = 0.01
 )
+rSeed = .Random.seed
 stopifnot(abs(nativeOptimizer[[1]] - rOptimizer[[1]]) < 1e-9)
 stopifnot(max(abs(nativeOptimizer[[2]] - rOptimizer[[2]])) < 1e-12)
 stopifnot(max(abs(nativeOptimizer[[3]] - rOptimizer[[3]])) < 1e-12)
 stopifnot(max(abs(nativeOptimizer[[4]] - rOptimizer[[4]])) < 1e-9)
 stopifnot(max(abs(nativeOptimizer[[5]] - rOptimizer[[5]])) < 1e-8)
+stopifnot(identical(nativeSeed, rSeed))
 rye.nativeOptimizer = TRUE
+
+## Conditional draw paths must consume the same state in every optimization
+## mode, including the acceptance-only path.
+optimizationModes = list(
+  c(TRUE, FALSE), c(FALSE, TRUE), c(FALSE, FALSE)
+)
+for (modeIndex in seq_along(optimizationModes)) {
+  mode = optimizationModes[[modeIndex]]
+  set.seed(1000 + modeIndex)
+  modeNative = rye.gibbs(
+    referenceX, referenceFam, referenceGroups,
+    alpha, mode[[1]], weight, mode[[2]], iterations = 75, sd = 0.01
+  )
+  modeNativeSeed = .Random.seed
+  rye.nativeOptimizer = FALSE
+  set.seed(1000 + modeIndex)
+  modeR = rye.gibbs(
+    referenceX, referenceFam, referenceGroups,
+    alpha, mode[[1]], weight, mode[[2]], iterations = 75, sd = 0.01
+  )
+  stopifnot(abs(modeNative[[1]] - modeR[[1]]) < 1e-9)
+  stopifnot(max(abs(modeNative[[2]] - modeR[[2]])) < 1e-12)
+  stopifnot(max(abs(modeNative[[3]] - modeR[[3]])) < 1e-12)
+  stopifnot(max(abs(modeNative[[4]] - modeR[[4]])) < 1e-9)
+  stopifnot(max(abs(modeNative[[5]] - modeR[[5]])) < 1e-8)
+  stopifnot(identical(modeNativeSeed, .Random.seed))
+  rye.nativeOptimizer = TRUE
+}
+
+## L'Ecuyer-CMRG state and draws must also round-trip exactly through Rust.
+RNGkind('L\'Ecuyer-CMRG', normal.kind = 'Inversion', sample.kind = 'Rejection')
+set.seed(456)
+lecuyerNative = rye.gibbs(
+  referenceX, referenceFam, referenceGroups,
+  alpha, TRUE, weight, TRUE, iterations = 200, sd = 0.01
+)
+lecuyerNativeSeed = .Random.seed
+rye.nativeOptimizer = FALSE
+set.seed(456)
+lecuyerR = rye.gibbs(
+  referenceX, referenceFam, referenceGroups,
+  alpha, TRUE, weight, TRUE, iterations = 200, sd = 0.01
+)
+lecuyerRSeed = .Random.seed
+stopifnot(abs(lecuyerNative[[1]] - lecuyerR[[1]]) < 1e-9)
+stopifnot(max(abs(lecuyerNative[[2]] - lecuyerR[[2]])) < 1e-12)
+stopifnot(max(abs(lecuyerNative[[3]] - lecuyerR[[3]])) < 1e-12)
+stopifnot(max(abs(lecuyerNative[[4]] - lecuyerR[[4]])) < 1e-9)
+stopifnot(max(abs(lecuyerNative[[5]] - lecuyerR[[5]])) < 1e-8)
+stopifnot(identical(lecuyerNativeSeed, lecuyerRSeed))
+rye.nativeOptimizer = TRUE
+
+## Unsupported R generators must fall back without consuming RNG state during
+## the failed native attempt.
+RNGkind('Wichmann-Hill', normal.kind = 'Inversion', sample.kind = 'Rejection')
+set.seed(789)
+fallbackResult = rye.gibbs(
+  referenceX, referenceFam, referenceGroups,
+  alpha, TRUE, weight, TRUE, iterations = 100, sd = 0.01
+)
+fallbackSeed = .Random.seed
+rye.nativeOptimizer = FALSE
+set.seed(789)
+directResult = rye.gibbs(
+  referenceX, referenceFam, referenceGroups,
+  alpha, TRUE, weight, TRUE, iterations = 100, sd = 0.01
+)
+directSeed = .Random.seed
+stopifnot(identical(fallbackResult, directResult))
+stopifnot(identical(fallbackSeed, directSeed))
+rye.nativeOptimizer = TRUE
+
+## Deterministic math must reproduce both outputs and final RNG state exactly.
+RNGkind('Mersenne-Twister', normal.kind = 'Inversion', sample.kind = 'Rejection')
+rye.nativeDeterministicMath = TRUE
+set.seed(321)
+deterministicFirst = rye.gibbs(
+  referenceX, referenceFam, referenceGroups,
+  alpha, TRUE, weight, TRUE, iterations = 200, sd = 0.01
+)
+deterministicFirstSeed = .Random.seed
+set.seed(321)
+deterministicSecond = rye.gibbs(
+  referenceX, referenceFam, referenceGroups,
+  alpha, TRUE, weight, TRUE, iterations = 200, sd = 0.01
+)
+stopifnot(identical(deterministicFirst, deterministicSecond))
+stopifnot(identical(deterministicFirstSeed, .Random.seed))
+rye.nativeDeterministicMath = FALSE
+
+## Native execution must initialize and return R state when the session has not
+## generated a random number yet.
+rm('.Random.seed', envir = .GlobalEnv)
+unseededResult = rye.gibbs(
+  referenceX, referenceFam, referenceGroups,
+  alpha, TRUE, weight, TRUE, iterations = 1, sd = 0.01
+)
+stopifnot(length(unseededResult) == 5)
+stopifnot(is.integer(.Random.seed), length(.Random.seed) == 626)
+
+## Forked outer parallelism must remain safe with independent L'Ecuyer streams.
+if (.Platform$OS.type != 'windows') {
+  RNGkind('L\'Ecuyer-CMRG', normal.kind = 'Inversion', sample.kind = 'Rejection')
+  set.seed(654)
+  parallelResult = rye.optimize(
+    referenceX, referenceFam,
+    referencePops = groups, referenceGroups = referenceGroups,
+    alpha = alpha, weight = weight,
+    attempts = 2, iterations = 20, rounds = 2, threads = 2
+  )
+  stopifnot(length(parallelResult) == 5, is.finite(parallelResult[[1]]))
+  RNGkind('Mersenne-Twister', normal.kind = 'Inversion', sample.kind = 'Rejection')
+}
 
 ## When nnls is installed, check numerical parity with Rye's compatibility path.
 if (requireNamespace('nnls', quietly = TRUE)) {

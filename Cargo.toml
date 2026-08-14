@@ -8,6 +8,9 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[dependencies]
+rng-compat-r = "=0.1.0"
+
 [profile.release]
 codegen-units = 1
 lto = "fat"

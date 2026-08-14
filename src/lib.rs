@@ -2,6 +2,7 @@ mod nnls;
 mod simd;
 
 use nnls::{FactorCache, solve_nnls};
+use rng_compat_r::{MathMode, RRng, pnorm_with_mode};
 use simd::{AxpyKernel, select_axpy};
 use std::ffi::{c_int, c_void};
 use std::mem;
@@ -9,9 +10,14 @@ use std::slice;
 
 type Sexp = *mut c_void;
 
+const INTSXP: c_int = 13;
 const REALSXP: c_int = 14;
+const VECSXP: c_int = 19;
 
 unsafe extern "C" {
+    static mut R_NilValue: Sexp;
+
+    fn INTEGER(value: Sexp) -> *mut c_int;
     fn Rf_allocMatrix(kind: c_int, rows: c_int, columns: c_int) -> Sexp;
     fn Rf_allocVector(kind: c_int, length: isize) -> Sexp;
     fn Rf_ncols(value: Sexp) -> c_int;
@@ -19,14 +25,9 @@ unsafe extern "C" {
     fn Rf_protect(value: Sexp) -> Sexp;
     fn Rf_ScalarInteger(value: c_int) -> Sexp;
     fn Rf_unprotect(count: c_int);
+    fn Rf_xlength(value: Sexp) -> isize;
     fn REAL(value: Sexp) -> *mut f64;
-
-    fn GetRNGstate();
-    fn PutRNGstate();
-    fn R_unif_index(limit: f64) -> f64;
-    fn norm_rand() -> f64;
-    fn unif_rand() -> f64;
-    fn Rf_pnorm5(value: f64, mean: f64, sd: f64, lower_tail: c_int, log: c_int) -> f64;
+    fn SET_VECTOR_ELT(vector: Sexp, index: isize, value: Sexp);
 }
 
 struct SolverWorkspace {
@@ -224,6 +225,12 @@ pub extern "C" fn rye_simd_level() -> Sexp {
     unsafe { Rf_ScalarInteger(simd::kernel_level()) }
 }
 
+/// Return the native optimizer ABI version expected by the R wrapper.
+#[unsafe(no_mangle)]
+pub extern "C" fn rye_optimizer_abi() -> Sexp {
+    unsafe { Rf_ScalarInteger(2) }
+}
+
 /// Solve all rows of X against the same ancestry basis in one R-to-native call.
 ///
 /// # Safety
@@ -289,10 +296,11 @@ pub unsafe extern "C" fn rye_nnls_batch(
 ///
 /// # Safety
 ///
-/// R must pass dimensionally compatible double matrices/vectors. The wrapper
-/// validates dimensions, group indices, and the 63-group active-mask limit.
+/// R must pass dimensionally compatible double matrices/vectors and an integer
+/// `.Random.seed`. The wrapper validates dimensions, group indices, RNG type,
+/// and the 63-group active-mask limit.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rye_gibbs_native(
+pub unsafe extern "C" fn rye_gibbs_native_v2(
     x_sexp: Sexp,
     raw_means_sexp: Sexp,
     alpha_sexp: Sexp,
@@ -301,6 +309,7 @@ pub unsafe extern "C" fn rye_gibbs_native(
     target_group_sexp: Sexp,
     sample_weight_sexp: Sexp,
     controls_sexp: Sexp,
+    seed_sexp: Sexp,
 ) -> Sexp {
     let samples = unsafe { Rf_nrows(x_sexp) as usize };
     let features = unsafe { Rf_ncols(x_sexp) as usize };
@@ -313,11 +322,25 @@ pub unsafe extern "C" fn rye_gibbs_native(
         unsafe { slice::from_raw_parts(REAL(alpha_for_group_sexp), groups) };
     let target_group_input = unsafe { slice::from_raw_parts(REAL(target_group_sexp), samples) };
     let sample_weight = unsafe { slice::from_raw_parts(REAL(sample_weight_sexp), samples) };
-    let controls = unsafe { slice::from_raw_parts(REAL(controls_sexp), 4) };
+    let controls = unsafe { slice::from_raw_parts(REAL(controls_sexp), 5) };
     let iterations = controls[0] as usize;
     let proposal_sd = controls[1];
     let optimize_alpha = controls[2] != 0.0;
     let optimize_weight = controls[3] != 0.0;
+    let math_mode = if controls[4] != 0.0 {
+        MathMode::Deterministic
+    } else {
+        MathMode::Platform
+    };
+    let seed_length = unsafe { Rf_xlength(seed_sexp) };
+    if seed_length <= 0 {
+        return unsafe { R_NilValue };
+    }
+    let seed = unsafe { slice::from_raw_parts(INTEGER(seed_sexp), seed_length as usize) };
+    let Ok(mut rng) = RRng::from_random_seed(seed) else {
+        return unsafe { R_NilValue };
+    };
+    rng.set_math_mode(math_mode);
     let alpha_for_group: Vec<usize> = alpha_for_group_input
         .iter()
         .map(|&value| value as usize)
@@ -396,7 +419,6 @@ pub unsafe extern "C" fn rye_gibbs_native(
     let mut proposal_rhs = current_rhs.clone();
     let mut proposal_coefficients = current_coefficients.clone();
 
-    unsafe { GetRNGstate() };
     for _ in 0..iterations {
         proposal_alpha.clone_from_slice(&current_alpha);
         proposal_weight.clone_from_slice(&current_weight);
@@ -404,8 +426,8 @@ pub unsafe extern "C" fn rye_gibbs_native(
         proposal_rhs.clone_from_slice(&current_rhs);
 
         let alpha_index = if optimize_alpha {
-            let index = unsafe { R_unif_index(groups as f64) as usize };
-            let noise = unsafe { norm_rand() };
+            let index = rng.sample_index(groups);
+            let noise = rng.rnorm(0.0, 1.0);
             proposal_alpha[index] = (proposal_alpha[index]
                 + noise * (proposal_alpha[index].abs() + 0.001) * proposal_sd
                 + alpha_momentum[index])
@@ -415,8 +437,8 @@ pub unsafe extern "C" fn rye_gibbs_native(
             None
         };
         let weight_index = if optimize_weight {
-            let index = unsafe { R_unif_index(features as f64) as usize };
-            let noise = unsafe { norm_rand() };
+            let index = rng.sample_index(features);
+            let noise = rng.rnorm(0.0, 1.0);
             proposal_weight[index] = (proposal_weight[index]
                 + noise * (proposal_weight[index] + 0.001) * proposal_sd
                 + weight_momentum[index])
@@ -481,9 +503,16 @@ pub unsafe extern "C" fn rye_gibbs_native(
             best_basis.clone_from_slice(&proposal_basis);
             best_coefficients.clone_from_slice(&proposal_coefficients);
         }
-        let probability =
-            unsafe { 1.0 - Rf_pnorm5(proposal_error, current_error, current_error / 1000.0, 1, 0) };
-        if unsafe { unif_rand() } < probability {
+        let probability = 1.0
+            - pnorm_with_mode(
+                proposal_error,
+                current_error,
+                current_error / 1000.0,
+                true,
+                false,
+                math_mode,
+            );
+        if rng.runif() < probability {
             for index in 0..groups {
                 alpha_momentum[index] = alpha_momentum[index] / 2.0
                     + (proposal_alpha[index] - current_alpha[index]) / 10.0;
@@ -501,11 +530,11 @@ pub unsafe extern "C" fn rye_gibbs_native(
             mem::swap(&mut current_coefficients, &mut proposal_coefficients);
         }
     }
-    unsafe { PutRNGstate() };
 
     let result_length = 1 + groups + features + groups * features + samples * groups;
-    let answer = unsafe { Rf_protect(Rf_allocVector(REALSXP, result_length as isize)) };
-    let result = unsafe { slice::from_raw_parts_mut(REAL(answer), result_length) };
+    let answer = unsafe { Rf_protect(Rf_allocVector(VECSXP, 2)) };
+    let optimizer_result = unsafe { Rf_protect(Rf_allocVector(REALSXP, result_length as isize)) };
+    let result = unsafe { slice::from_raw_parts_mut(REAL(optimizer_result), result_length) };
     let mut offset = 0;
     result[offset] = best_error;
     offset += 1;
@@ -520,6 +549,18 @@ pub unsafe extern "C" fn rye_gibbs_native(
     }
     offset += groups * features;
     copy_normalized(&best_coefficients, samples, groups, &mut result[offset..]);
-    unsafe { Rf_unprotect(1) };
+
+    let seed_length = rng.random_seed_len();
+    let seed_result = unsafe { Rf_protect(Rf_allocVector(INTSXP, seed_length as isize)) };
+    let seed_output = unsafe { slice::from_raw_parts_mut(INTEGER(seed_result), seed_length) };
+    if rng.write_random_seed(seed_output).is_err() {
+        unsafe { Rf_unprotect(3) };
+        return unsafe { R_NilValue };
+    }
+    unsafe {
+        SET_VECTOR_ELT(answer, 0, optimizer_result);
+        SET_VECTOR_ELT(answer, 1, seed_result);
+        Rf_unprotect(3);
+    }
     answer
 }

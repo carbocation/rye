@@ -24,6 +24,9 @@ for(p in requiredPackages){
 rye.nativeSolver = FALSE
 rye.nativeOptimizer = FALSE
 rye.nativeKernel = 'scalar'
+rye.nativeDeterministicMath = tolower(
+  Sys.getenv('RYE_DETERMINISTIC_MATH', unset = 'false')
+) %in% c('1', 'true', 'yes')
 rye.nativeLibrary = switch(
   .Platform$OS.type,
   windows = 'rye_core.dll',
@@ -44,7 +47,9 @@ for (nativeLibraryPath in nativeLibraryPaths[file.exists(nativeLibraryPaths)]) {
 }
 if (rye.nativeSolver) {
   nativeLevel = try(.Call('rye_simd_level'), silent = TRUE)
-  if (!inherits(nativeLevel, 'try-error')) {
+  optimizerABI = try(.Call('rye_optimizer_abi'), silent = TRUE)
+  if (!inherits(nativeLevel, 'try-error') &&
+      !inherits(optimizerABI, 'try-error') && identical(optimizerABI, 2L)) {
     rye.nativeOptimizer = TRUE
     rye.nativeKernel = c('scalar', 'NEON', 'AVX2', 'AVX-512')[[nativeLevel + 1]]
   }
@@ -185,8 +190,15 @@ rye.gibbsNative = function(X, fam, baseMeans, pops,
   orderedMeans = baseMeans[pops, , drop = FALSE]
   if (!is.double(X)) storage.mode(X) = 'double'
   if (!is.double(orderedMeans)) storage.mode(orderedMeans) = 'double'
-  result = .Call(
-    'rye_gibbs_native',
+  if (!exists('.Random.seed', envir = .GlobalEnv, inherits = FALSE)) {
+    set.seed(NULL)
+  }
+  rngState = get('.Random.seed', envir = .GlobalEnv, inherits = FALSE)
+  if (!is.integer(rngState)) {
+    return(NULL)
+  }
+  nativeResult = .Call(
+    'rye_gibbs_native_v2',
     X,
     orderedMeans,
     as.numeric(alpha),
@@ -194,8 +206,14 @@ rye.gibbsNative = function(X, fam, baseMeans, pops,
     as.numeric(baseIndex - 1),
     as.numeric(targetGroup - 1),
     as.numeric(sampleWeight),
-    c(iterations, sd, optimizeAlpha, optimizeWeight)
+    c(iterations, sd, optimizeAlpha, optimizeWeight, rye.nativeDeterministicMath),
+    rngState
   )
+  if (is.null(nativeResult)) {
+    return(NULL)
+  }
+  result = nativeResult[[1]]
+  assign('.Random.seed', nativeResult[[2]], envir = .GlobalEnv)
 
   groups = length(pops)
   features = ncol(X)

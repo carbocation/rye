@@ -38,7 +38,8 @@ git clone https://github.com/healthdisparities/rye
 
 cd rye
 
-# Build the single-thread-optimized Rust solver (no third-party Rust crates)
+# Build the single-thread-optimized Rust solver
+# Cargo fetches the published rng-compat-r and its pinned libm dependency.
 cargo build --release
 
 # Check if the install happened correctly
@@ -51,9 +52,15 @@ If Rust is unavailable, install `nnls` with `Rscript -e 'install.packages("nnls"
 
 The Rust solver moves each complete Gibbs attempt across a single R/native boundary. It keeps NNLS and proposal buffers resident, updates right-hand sides incrementally when one alpha and one weight change, caches active-set factorizations, and removes repeated population aggregation from the optimization loop. Contiguous sample-wise kernels select NEON, AVX2, or AVX-512 at runtime with a scalar fallback. The selected kernel is printed at startup.
 
+Rye transfers `.Random.seed` into Rust once per attempt. The published `rng-compat-r` crate then performs R-compatible index sampling, normal generation, acceptance probabilities, and final state serialization without calling back into R for each proposal. Mersenne Twister and L'Ecuyer-CMRG are accelerated; unsupported R generator configurations automatically use the R-orchestrated compatibility path without consuming state during the failed native attempt.
+
 The native solver does not create worker threads, so `--threads=1` receives the full SIMD and algorithmic speedup. When more threads are requested on macOS or Linux, Rye retains its outer process-level parallelism across independent attempts and avoids nested oversubscription.
 
-On the bundled 3,400-sample example, an isolated 500-proposal, one-thread optimizer benchmark improved from 8.701 seconds on the R/Fortran compatibility solver to 0.090 seconds with the persistent Rust optimizer (96.7x), with maximum prediction drift below `4e-11`. The full default 49,600-proposal run completed in 8.20 seconds on the ARM64/NEON development machine. AVX2 and AVX-512 kernels are compile-checked and selected automatically on supported x86-64 systems.
+On the bundled 3,400-sample example, an isolated 500-proposal, one-thread optimizer benchmark improved from 8.701 seconds on the R/Fortran compatibility solver to 0.090 seconds with the persistent Rust optimizer (96.7x), with maximum prediction drift below `4e-11`. Removing the remaining per-proposal R RNG/math callbacks reduced a matched 20,000-proposal run from 2.234 to 2.202 seconds on the ARM64/NEON development machine. The full default 49,600-proposal run completed in 8.20 seconds. AVX2 and AVX-512 kernels are compile-checked and selected automatically on supported x86-64 systems.
+
+Platform-native math is the default because it most closely tracks the local R build. Set `RYE_DETERMINISTIC_MATH=1` before starting Rye to use bit-stable normal and probability calculations across supported x86-64 and AArch64 machines. This mode had effectively identical throughput in the bundled benchmark.
+
+Re-run the isolated optimizer benchmark with `Rscript tests/benchmark_native_optimizer.R . 20000 5`; the final arguments select proposals per run and timed repetitions.
 
 ## Quickstart guide
 Example files are provided to help user understand the input and test Rye easily.  If the environment is setup correctly, the user should be able to run the following command to run Rye:
