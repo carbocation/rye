@@ -1,4 +1,7 @@
-use rye_core::{BatchNnlsInput, GibbsInput, MathMode, optimize_gibbs, simd_level, solve_batch};
+use rye_core::{
+    BatchNnlsInput, GibbsInput, LECUYER_RANDOM_SEED_LEN, MathMode, lecuyer_stream_seeds,
+    optimize_gibbs, simd_level, solve_batch,
+};
 use std::ffi::{c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;
@@ -34,7 +37,41 @@ pub extern "C" fn rye_simd_level() -> Sexp {
 /// Return the native optimizer ABI version expected by the R wrapper.
 #[unsafe(no_mangle)]
 pub extern "C" fn rye_optimizer_abi() -> Sexp {
-    unsafe { Rf_ScalarInteger(2) }
+    unsafe { Rf_ScalarInteger(3) }
+}
+
+/// Return a 7-by-count matrix of R-compatible L'Ecuyer worker streams.
+///
+/// # Safety
+///
+/// R must pass a serialized integer `.Random.seed` and a scalar integer count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rye_lecuyer_streams(seed_sexp: Sexp, count_sexp: Sexp) -> Sexp {
+    let seed_length = unsafe { Rf_xlength(seed_sexp) };
+    if seed_length <= 0 || unsafe { Rf_xlength(count_sexp) } != 1 {
+        return unsafe { R_NilValue };
+    }
+    let random_seed = unsafe { slice::from_raw_parts(INTEGER(seed_sexp), seed_length as usize) };
+    let count = unsafe { *INTEGER(count_sexp) };
+    if count <= 0 {
+        return unsafe { R_NilValue };
+    }
+    let Ok(Ok(streams)) = catch_unwind(AssertUnwindSafe(|| {
+        lecuyer_stream_seeds(random_seed, count as usize)
+    })) else {
+        return unsafe { R_NilValue };
+    };
+    let answer = unsafe {
+        Rf_protect(Rf_allocMatrix(
+            INTSXP,
+            LECUYER_RANDOM_SEED_LEN as c_int,
+            count,
+        ))
+    };
+    let result = unsafe { slice::from_raw_parts_mut(INTEGER(answer), streams.len()) };
+    result.copy_from_slice(&streams);
+    unsafe { Rf_unprotect(1) };
+    answer
 }
 
 /// Solve all rows of X against the same ancestry basis in one R-to-native call.

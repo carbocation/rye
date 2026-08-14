@@ -88,7 +88,7 @@ The Rust solver moves each complete Gibbs attempt across a single R/native bound
 
 Rye transfers `.Random.seed` into Rust once per attempt. The published `rng-compat-r` crate then performs R-compatible index sampling, normal generation, acceptance probabilities, and final state serialization without calling back into R for each proposal. Mersenne Twister and L'Ecuyer-CMRG are accelerated; unsupported R generator configurations automatically use the R-orchestrated compatibility path without consuming state during the failed native attempt.
 
-The native solver does not create worker threads, so `--threads=1` receives the full SIMD and algorithmic speedup. When more threads are requested on macOS or Linux, Rye retains its outer process-level parallelism across independent attempts and avoids nested oversubscription.
+The native solver does not create worker threads, so `--threads=1` receives the full SIMD and algorithmic speedup. When more threads are requested on macOS or Linux, Rye retains its outer process-level parallelism across independent attempts and avoids nested oversubscription. Pass `--seed=<integer>` (or `seed = <integer>` through the R API) for exact repeatability. Rye assigns an R-compatible L'Ecuyer stream to every logical round and attempt before launching workers, so results do not change when `--threads` changes. A preceding `set.seed()` is also respected when the explicit seed is omitted.
 
 On the bundled 3,400-sample example, an isolated 500-proposal, one-thread optimizer benchmark improved from 8.701 seconds on the R/Fortran compatibility solver to 0.090 seconds with the persistent Rust optimizer (96.7x), with maximum prediction drift below `4e-11`. Removing the remaining per-proposal R RNG/math callbacks reduced a matched 20,000-proposal run from 2.234 to 2.202 seconds on the ARM64/NEON development machine. Mask-batched NNLS and a vectorized objective then reduced the same run to 0.720 seconds (36.0 microseconds per proposal), a further 3.06x single-thread speedup. The full default 49,600-proposal run completed in 8.20 seconds before the mask-batched optimization. AVX2 and AVX-512 kernels are compile-checked and selected automatically on supported x86-64 systems.
 
@@ -190,6 +190,9 @@ Options:
         
         --attempts=<ATTEMPTS>
                 Number of attempts to find the optimum values (Default = 4)
+
+        --seed=<SEED>
+                Reproducible random seed
 
         -h, --help
                 Show this help message and exit

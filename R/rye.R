@@ -20,7 +20,7 @@ rye.detectNative = function() {
   nativeLevel = try(.Call('rye_simd_level'), silent = TRUE)
   optimizerABI = try(.Call('rye_optimizer_abi'), silent = TRUE)
   if (!inherits(nativeLevel, 'try-error') &&
-      !inherits(optimizerABI, 'try-error') && identical(optimizerABI, 2L)) {
+      !inherits(optimizerABI, 'try-error') && identical(optimizerABI, 3L)) {
     rye.nativeSolver <<- TRUE
     rye.nativeOptimizer <<- TRUE
     rye.nativeKernel <<- c('scalar', 'NEON', 'AVX2', 'AVX-512')[[nativeLevel + 1]]
@@ -41,6 +41,61 @@ rye.loadDevelopmentNative = function(repository = getwd()) {
     if (loaded) rye.detectNative()
   }
   invisible(rye.nativeSolver)
+}
+
+rye.positiveInteger = function(value, name) {
+  if (length(value) != 1 || is.na(value) || !is.finite(value) ||
+      value != floor(value) || value < 1 || value > .Machine$integer.max) {
+    stop(name, ' must be a positive integer')
+  }
+  as.integer(value)
+}
+
+rye.normalizeSeed = function(seed) {
+  if (is.null(seed)) return(NULL)
+  if (length(seed) != 1 || is.na(seed) || !is.finite(seed) ||
+      seed != floor(seed) || seed < -.Machine$integer.max ||
+      seed > .Machine$integer.max) {
+    stop('seed must be a single non-missing 32-bit integer')
+  }
+  as.integer(seed)
+}
+
+rye.restoreRandomSeed = function(existed, state) {
+  if (existed) {
+    assign('.Random.seed', state, envir = .GlobalEnv)
+  } else if (exists('.Random.seed', envir = .GlobalEnv, inherits = FALSE)) {
+    rm('.Random.seed', envir = .GlobalEnv)
+  }
+}
+
+rye.lecuyerStreams = function(seed, count) {
+  oldKind = RNGkind()
+  oldSeedExists = exists('.Random.seed', envir = .GlobalEnv, inherits = FALSE)
+  oldSeed = if (oldSeedExists) {
+    get('.Random.seed', envir = .GlobalEnv, inherits = FALSE)
+  } else {
+    NULL
+  }
+  on.exit({
+    do.call(RNGkind, as.list(oldKind))
+    rye.restoreRandomSeed(oldSeedExists, oldSeed)
+  })
+  RNGkind('L\'Ecuyer-CMRG', normal.kind = 'Inversion')
+  set.seed(seed)
+  state = get('.Random.seed', envir = .GlobalEnv, inherits = FALSE)
+  if (rye.nativeSolver) {
+    streams = .Call('rye_lecuyer_streams', state, as.integer(count))
+    if (!is.null(streams)) return(streams)
+  }
+
+  ## Compatibility path for a source checkout without the Rust accelerator.
+  streams = matrix(0L, nrow = length(state), ncol = count)
+  for (streamIndex in seq_len(count)) {
+    streams[ , streamIndex] = state
+    if (streamIndex < count) state = parallel::nextRNGStream(state)
+  }
+  streams
 }
 
 ################################################################################
@@ -337,7 +392,30 @@ rye.optimize = function(X = NULL, fam = NULL,
                         alpha = NULL, optimizeAlpha = TRUE,
                         weight = NULL, optimizeWeight = TRUE, attempts = 4,
                         iterations = 100, rounds = 25, threads = 1, startSD = 0.005, endSD = 0.001,
-                        populationError = FALSE) {
+                        populationError = FALSE, seed = NULL) {
+
+  attempts = rye.positiveInteger(attempts, 'attempts')
+  rounds = rye.positiveInteger(rounds, 'rounds')
+  threads = rye.positiveInteger(threads, 'threads')
+  seed = rye.normalizeSeed(seed)
+  streamCount = as.double(attempts) * as.double(rounds)
+  if (streamCount > .Machine$integer.max) {
+    stop('rounds multiplied by attempts is too large')
+  }
+
+  parentSeedExists = exists('.Random.seed', envir = .GlobalEnv, inherits = FALSE)
+  parentSeed = if (parentSeedExists) {
+    get('.Random.seed', envir = .GlobalEnv, inherits = FALSE)
+  } else {
+    NULL
+  }
+  if (is.null(seed)) {
+    seed = sample.int(.Machine$integer.max, 1L)
+    parentSeedExists = TRUE
+    parentSeed = get('.Random.seed', envir = .GlobalEnv, inherits = FALSE)
+  }
+  on.exit(rye.restoreRandomSeed(parentSeedExists, parentSeed), add = TRUE)
+  attemptStreams = rye.lecuyerStreams(seed, as.integer(streamCount))
 
   ## Pull out the reference PCs
   referenceFAM = fam[fam[ , 'population'] %in% referencePops , ]
@@ -362,18 +440,22 @@ rye.optimize = function(X = NULL, fam = NULL,
   for (round in seq(rounds)) {
 
     sd = if (rounds == 1) startSD else startSD - (startSD - endSD) * log(round)/log(rounds)
+    runAttempt = function(i) {
+      streamIndex = (round - 1L) * attempts + i
+      assign('.Random.seed', attemptStreams[ , streamIndex], envir = .GlobalEnv)
+      rye.gibbs(X = referenceX, fam = referenceFAM, referenceGroups = referenceGroups,
+                iterations = iterations,
+                alpha = alpha, weight = weight, sd = sd,
+                optimizeAlpha = optimizeAlpha, optimizeWeight = optimizeWeight,
+                baseMeans = baseMeans)
+    }
     if (threads > 1) {
-      params = parallel::mclapply(seq(attempts), function(i) rye.gibbs(X = referenceX, fam = referenceFAM, referenceGroups = referenceGroups,
-                                                            iterations = iterations,
-                                                            alpha = alpha, weight = weight, sd = sd,
-                                                            optimizeAlpha = optimizeAlpha, optimizeWeight = optimizeWeight,
-                                                            baseMeans = baseMeans), mc.cores = threads)
+      params = parallel::mclapply(
+        seq_len(attempts), runAttempt,
+        mc.cores = threads, mc.set.seed = FALSE
+      )
     } else {
-      params = lapply(seq(attempts), function(i) rye.gibbs(X = referenceX, fam = referenceFAM, referenceGroups = referenceGroups,
-                                                          iterations = iterations,
-                                                          alpha = alpha, weight = weight, sd = sd,
-                                                          optimizeAlpha = optimizeAlpha, optimizeWeight = optimizeWeight,
-                                                          baseMeans = baseMeans))
+      params = lapply(seq_len(attempts), runAttempt)
     }
 
 
@@ -407,7 +489,7 @@ rye.optimize = function(X = NULL, fam = NULL,
 rye = function(eigenvec_file = NULL, eigenval_file = NULL,
                pop2group_file = NULL, output_file = NULL,
                threads = 4, pcs = 20, optim_rounds = 200,
-               optim_iter = 100, attempts=4){
+               optim_iter = 100, attempts = 4, seed = NULL){
   ## Perform core operation
   #TODO: Change file reading method to data.table
   logmsg("Reading in Eigenvector file")
@@ -456,7 +538,8 @@ rye = function(eigenvec_file = NULL, eigenval_file = NULL,
                            threads = threads, iterations = optim_iter,
                            rounds = optim_rounds, attempts=attempts,
                            weight = scaledWeight, alpha = unifAlpha,
-                           optimizeWeight = TRUE, optimizeAlpha = TRUE)
+                           optimizeWeight = TRUE, optimizeAlpha = TRUE,
+                           seed = seed)
   optWeight = optParams[[3]]
   optMeans = optParams[[4]]
 
@@ -553,7 +636,9 @@ optionList = list(
               help = 'Number of iterations to use for optimization (higher number = more accurate but slower; Default=100)',
               metavar = '<optim-iters>'),
   optparse::make_option('--attempts', type = 'numeric', default = 4,
-              help = 'Number of attempts to find the optimum values (Default = 4)', metavar = '<ATTEMPTS>')
+              help = 'Number of attempts to find the optimum values (Default = 4)', metavar = '<ATTEMPTS>'),
+  optparse::make_option('--seed', type = 'integer', default = NULL,
+              help = 'Reproducible random seed', metavar = '<SEED>')
 )
 
 rye.main = function(args = commandArgs(trailingOnly = TRUE)) {
@@ -579,6 +664,7 @@ rye.main = function(args = commandArgs(trailingOnly = TRUE)) {
       output_file = opt$output,
       threads = opt$threads,
       attempts = opt$attempts,
+      seed = opt$seed,
       pcs = opt$pcs,
       optim_rounds = opt$rounds,
       optim_iter = opt$iter)

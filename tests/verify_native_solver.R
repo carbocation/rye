@@ -172,18 +172,47 @@ unseededResult = rye.gibbs(
 stopifnot(length(unseededResult) == 5)
 stopifnot(is.integer(.Random.seed), length(.Random.seed) == 626)
 
-## Forked outer parallelism must remain safe with independent L'Ecuyer streams.
+## Every logical attempt receives the same deterministic L'Ecuyer stream,
+## regardless of whether attempts run serially or in forked workers.
 if (.Platform$OS.type != 'windows') {
-  RNGkind('L\'Ecuyer-CMRG', normal.kind = 'Inversion', sample.kind = 'Rejection')
+  RNGkind('Mersenne-Twister', normal.kind = 'Inversion', sample.kind = 'Rejection')
   set.seed(654)
+  callerSeed = .Random.seed
+  serialResult = rye.optimize(
+    referenceX, referenceFam,
+    referencePops = groups, referenceGroups = referenceGroups,
+    alpha = alpha, weight = weight,
+    attempts = 4, iterations = 50, rounds = 3, threads = 1,
+    seed = 2026
+  )
+  stopifnot(identical(callerSeed, .Random.seed))
   parallelResult = rye.optimize(
     referenceX, referenceFam,
     referencePops = groups, referenceGroups = referenceGroups,
     alpha = alpha, weight = weight,
-    attempts = 2, iterations = 20, rounds = 2, threads = 2
+    attempts = 4, iterations = 50, rounds = 3, threads = 2,
+    seed = 2026
   )
-  stopifnot(length(parallelResult) == 5, is.finite(parallelResult[[1]]))
-  RNGkind('Mersenne-Twister', normal.kind = 'Inversion', sample.kind = 'Rejection')
+  stopifnot(identical(serialResult, parallelResult))
+  stopifnot(identical(callerSeed, .Random.seed))
+
+  set.seed(777)
+  implicitSerial = rye.optimize(
+    referenceX, referenceFam,
+    referencePops = groups, referenceGroups = referenceGroups,
+    alpha = alpha, weight = weight,
+    attempts = 4, iterations = 50, rounds = 3, threads = 1
+  )
+  implicitSerialSeed = .Random.seed
+  set.seed(777)
+  implicitParallel = rye.optimize(
+    referenceX, referenceFam,
+    referencePops = groups, referenceGroups = referenceGroups,
+    alpha = alpha, weight = weight,
+    attempts = 4, iterations = 50, rounds = 3, threads = 2
+  )
+  stopifnot(identical(implicitSerial, implicitParallel))
+  stopifnot(identical(implicitSerialSeed, .Random.seed))
 }
 
 ## When nnls is installed, check numerical parity with Rye's compatibility path.

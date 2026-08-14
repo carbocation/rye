@@ -17,7 +17,7 @@ nonnegative ancestry coefficients using Rye's Rust numerical core.
 \usage{
 rye(eigenvec_file = NULL, eigenval_file = NULL, pop2group_file = NULL,
     output_file = NULL, threads = 4, pcs = 20, optim_rounds = 200,
-    optim_iter = 100, attempts = 4)
+    optim_iter = 100, attempts = 4, seed = NULL)
 
 rye.scale(X = NULL)
 
@@ -42,7 +42,7 @@ rye.optimize(X = NULL, fam = NULL, referencePops = NULL,
     referenceGroups = NULL, alpha = NULL, optimizeAlpha = TRUE,
     weight = NULL, optimizeWeight = TRUE, attempts = 4,
     iterations = 100, rounds = 25, threads = 1, startSD = 0.005,
-    endSD = 0.001, populationError = FALSE)
+    endSD = 0.001, populationError = FALSE, seed = NULL)
 
 rye.main(args = commandArgs(trailingOnly = TRUE))
 }
@@ -52,6 +52,8 @@ rye.main(args = commandArgs(trailingOnly = TRUE))
   \item{threads}{Number of independent attempts that may run concurrently.}
   \item{pcs}{Number of principal components to use.}
   \item{optim_rounds, optim_iter, attempts, iterations, rounds}{Optimization controls.}
+  \item{seed}{Optional 32-bit integer seed. The same seed produces identical
+  logical attempt streams regardless of the number of workers.}
   \item{X}{Numeric sample-by-feature matrix.}
   \item{fam}{Sample population and identifier matrix.}
   \item{fn}{Summary function used for reference populations.}

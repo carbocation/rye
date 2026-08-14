@@ -70,6 +70,37 @@ pub struct GibbsResult {
     pub random_seed: Vec<i32>,
 }
 
+pub const LECUYER_RANDOM_SEED_LEN: usize = 7;
+
+/// Derive deterministic, non-overlapping R-compatible worker streams.
+///
+/// Stream zero is `random_seed`. Each subsequent state is advanced by R's
+/// `parallel::nextRNGStream()` jump. States are stored contiguously in the
+/// returned vector. Importing the initial state preserves the calling R
+/// version's serialized RNG metadata.
+pub fn lecuyer_stream_seeds(random_seed: &[i32], count: usize) -> Result<Vec<i32>, CoreError> {
+    let output_len =
+        count
+            .checked_mul(LECUYER_RANDOM_SEED_LEN)
+            .ok_or(CoreError::InvalidDimensions(
+                "random stream count exceeds addressable memory",
+            ))?;
+    let mut output = vec![0_i32; output_len];
+    let mut rng =
+        RRng::from_random_seed(random_seed).map_err(|_| CoreError::UnsupportedRandomSeed)?;
+    for stream_index in 0..count {
+        let offset = stream_index * LECUYER_RANDOM_SEED_LEN;
+        rng.write_random_seed(&mut output[offset..offset + LECUYER_RANDOM_SEED_LEN])
+            .map_err(|_| CoreError::UnsupportedRandomSeed)?;
+        if stream_index + 1 < count {
+            rng = rng
+                .next_rng_stream()
+                .map_err(|_| CoreError::UnsupportedRandomSeed)?;
+        }
+    }
+    Ok(output)
+}
+
 #[inline]
 fn shrunk_mean(value: f64, alpha: f64) -> f64 {
     let distance = 0.5 - value;
@@ -515,4 +546,23 @@ pub fn optimize_gibbs(input: GibbsInput<'_>) -> Result<GibbsResult, CoreError> {
 /// Selected SIMD kernel: scalar=0, NEON=1, AVX2=2, AVX-512=3.
 pub fn simd_level() -> i32 {
     simd::kernel_level()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LECUYER_RANDOM_SEED_LEN, lecuyer_stream_seeds};
+    use rng_compat_r::{RRng, RUniformKind};
+
+    #[test]
+    fn worker_streams_match_successive_r_jumps() {
+        let initial = RRng::from_seed_with_kind(42, RUniformKind::LecuyerCmrg);
+        let streams = lecuyer_stream_seeds(&initial.random_seed(), 4).unwrap();
+        assert_eq!(streams.len(), 4 * LECUYER_RANDOM_SEED_LEN);
+
+        let mut expected = initial;
+        for stream in streams.chunks_exact(LECUYER_RANDOM_SEED_LEN) {
+            assert_eq!(stream, expected.random_seed());
+            expected = expected.next_rng_stream().unwrap();
+        }
+    }
 }

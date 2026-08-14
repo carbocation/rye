@@ -14,6 +14,7 @@
 
 extern SEXP rye_simd_level(void);
 extern SEXP rye_optimizer_abi(void);
+extern SEXP rye_lecuyer_streams(SEXP, SEXP);
 extern SEXP rye_nnls_batch(SEXP, SEXP, SEXP, SEXP);
 extern SEXP rye_gibbs_native_v2(
     SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP
@@ -22,6 +23,7 @@ extern SEXP rye_gibbs_native_v2(
 static const R_CallMethodDef CallEntries[] = {
     {"rye_simd_level", (DL_FUNC) &rye_simd_level, 0},
     {"rye_optimizer_abi", (DL_FUNC) &rye_optimizer_abi, 0},
+    {"rye_lecuyer_streams", (DL_FUNC) &rye_lecuyer_streams, 2},
     {"rye_nnls_batch", (DL_FUNC) &rye_nnls_batch, 4},
     {"rye_gibbs_native_v2", (DL_FUNC) &rye_gibbs_native_v2, 9},
     {NULL, NULL, 0}
