@@ -12,11 +12,38 @@ script_title = "rye.R"
 
 ################################################################################
 ### Load libraries
-requiredPackages = c('nnls','Hmisc','parallel', 'optparse', 'crayon')
+requiredPackages = c('parallel', 'optparse', 'crayon')
 for(p in requiredPackages){
   if(!suppressMessages(require(p,character.only = TRUE, quietly = T))){
     stop(paste0("Library ", p, " is required, I can't seem to find it."))
   } 
+}
+
+## Load the optional Rust batch solver. The original nnls implementation is
+## retained as a fallback so existing installations continue to work.
+rye.nativeSolver = FALSE
+rye.nativeLibrary = switch(
+  .Platform$OS.type,
+  windows = 'rye_core.dll',
+  paste0('librye_core', if (Sys.info()[['sysname']] == 'Darwin') '.dylib' else '.so')
+)
+scriptArgument = grep('^--file=', commandArgs(trailingOnly = FALSE), value = TRUE)
+scriptDirectory = if (length(scriptArgument)) {
+  dirname(normalizePath(sub('^--file=', '', scriptArgument[[1]])))
+} else {
+  getwd()
+}
+nativeLibraryPaths = unique(file.path(
+  c(scriptDirectory, getwd()), 'target', 'release', rye.nativeLibrary
+))
+for (nativeLibraryPath in nativeLibraryPaths[file.exists(nativeLibraryPaths)]) {
+  rye.nativeSolver = !inherits(try(dyn.load(nativeLibraryPath), silent = TRUE), 'try-error')
+  if (rye.nativeSolver) break
+}
+if (!rye.nativeSolver && !suppressMessages(require('nnls', character.only = TRUE, quietly = TRUE))) {
+  stop(paste0(
+    "Either build the Rust accelerator with 'cargo build --release' or install the nnls R package."
+  ))
 }
 
 options(width = 220)
@@ -56,8 +83,7 @@ rye.scale = function(X = NULL) {
   return(apply(X, 2, function(i){i = i - min(i); i / max(i)}))
 }
 
-rye.populationMeans = function(X = NULL, fam = NULL, alpha = NULL, weight = NULL, fn = median, referenceGroups = NULL) {
-  
+rye.basePopulationMeans = function(X = NULL, fam = NULL, fn = median, referenceGroups = NULL) {
   ## Find the mean of each reference population
   if (!is.null(referenceGroups)) {
     means = aggregate(X, by = list(referenceGroups[fam[ , 'population']]), fn)
@@ -67,25 +93,62 @@ rye.populationMeans = function(X = NULL, fam = NULL, alpha = NULL, weight = NULL
   
   ## Reformat
   rownames(means) = means[ , 1]
-  means = means[ , 2:ncol(means)]
-  
-  ## Apply shrinkage by given method and alpha
-  means = apply(means, 2, function(i)  i + (((1/2 - i)**2) * (((i > 1/2) * -1) + (i <= 1/2)) * alpha))
-  
-  ## Weight each feature
-  means = t(t(means) * weight)
-  
-  return(means)
+  return(as.matrix(means[ , 2:ncol(means), drop = FALSE]))
 }
 
-rye.predict = function(X = NULL, means = NULL, weight = NULL, referenceGroups = NULL) {
+rye.parameterizePopulationMeans = function(means = NULL, alpha = NULL, weight = NULL) {
+  ## Apply shrinkage by given method and alpha
+  means = means + (((1/2 - means)**2) * ifelse(means > 1/2, -1, 1) * alpha)
   
-  estimates = t(apply(t(t(X) * weight), 1, function(i){c = coef(nnls(A= as.matrix(t(means)), b = i)); c / sum(c)}))
+  ## Weight each feature
+  return(means * rep(weight, each = nrow(means)))
+}
+
+rye.populationMeans = function(X = NULL, fam = NULL, alpha = NULL, weight = NULL, fn = median, referenceGroups = NULL) {
+  means = rye.basePopulationMeans(X = X, fam = fam, fn = fn, referenceGroups = referenceGroups)
+  return(rye.parameterizePopulationMeans(means = means, alpha = alpha, weight = weight))
+}
+
+rye.predict = function(X = NULL, means = NULL, weight = NULL, referenceGroups = NULL, warmStart = NULL) {
+  
+  if (rye.nativeSolver) {
+    if (ncol(X) != ncol(means) || length(weight) != ncol(X)) {
+      stop('X, means, and weight have incompatible dimensions')
+    }
+    if (nrow(means) > 63) {
+      stop('The Rust solver currently supports at most 63 reference populations')
+    }
+    if (!is.double(X)) storage.mode(X) = 'double'
+    if (!is.double(means)) storage.mode(means) = 'double'
+    if (is.null(warmStart) || !identical(dim(warmStart), c(nrow(X), nrow(means)))) {
+      warmStart = matrix(numeric(), nrow = 0, ncol = 0)
+    } else if (!is.double(warmStart)) {
+      storage.mode(warmStart) = 'double'
+    }
+    estimates = .Call(
+      'rye_nnls_batch',
+      X, means, as.numeric(weight), warmStart
+    )
+    estimates = estimates / rowSums(estimates)
+  } else {
+    weightedX = X * rep(weight, each = nrow(X))
+    design = as.matrix(t(means))
+    estimates = t(vapply(seq_len(nrow(weightedX)), function(row) {
+      coefficients = coef(nnls(A = design, b = weightedX[row, ]))
+      coefficients / sum(coefficients)
+    }, numeric(nrow(means))))
+  }
   colnames(estimates) = rownames(means)
+  rownames(estimates) = rownames(X)
   
   if (!is.null(referenceGroups)) {
-    estimates = do.call(cbind, lapply(unique(referenceGroups), function(i) apply(estimates[ , names(referenceGroups)[referenceGroups == i], drop = FALSE], 1, sum)))
-    colnames(estimates) = unique(referenceGroups)
+    groups = unique(referenceGroups)
+    populationGroups = unname(referenceGroups[colnames(estimates)])
+    groupIndex = match(populationGroups, groups)
+    membership = matrix(0, nrow = ncol(estimates), ncol = length(groups))
+    membership[cbind(seq_len(nrow(membership)), groupIndex)] = 1
+    estimates = estimates %*% membership
+    colnames(estimates) = groups
   }
   return(estimates)
 }
@@ -105,30 +168,34 @@ rye.gibbs = function(X = NULL, fam = NULL, referenceGroups = NULL,
   
   pops = names(alpha)
   
-  ## Assume the correct ref assignment is 100% their population
-  expected = matrix(0, nrow = nrow(X), ncol = length(pops), dimnames = list(rownames(fam), pops))
-  expected[fam[ , c('id', 'population')]] <- 1
-  
   ## Make each pop its own group if groups aren't given
   if (is.null(referenceGroups)) {
     referenceGroups = pops
     names(referenceGroups) = pops
   }
   
-  expected = matrix(0, nrow = nrow(X), ncol = length(unique(referenceGroups)), dimnames = list(rownames(fam), unique(referenceGroups)))
-  expected[cbind(fam[ , 'id'], referenceGroups[fam[ , 'population']])] = 1
-  
   fam = cbind(fam, referenceGroups[fam[ , 'population']])
   colnames(fam)[ncol(fam)] = 'group'
+
+  ## Population membership and raw medians do not change during optimization.
+  ## The historical implementation recomputed both for every proposal.
+  baseMeans = rye.basePopulationMeans(
+    X = X, fam = fam, referenceGroups = referenceGroups
+  )
+
+  predictionGroups = unique(referenceGroups)
+  targetColumn = match(fam[ , 'group'], predictionGroups)
+  groupCounts = table(fam[ , 'group'])
+  sampleWeight = 1 / (length(groupCounts) * as.numeric(groupCounts[fam[ , 'group']]))
+  predictionError = function(predicted) {
+    targetProbability = predicted[cbind(seq_len(nrow(predicted)), targetColumn)]
+    sum(sampleWeight * (2 * (1 - targetProbability) / ncol(predicted)))
+  }
   
   ## Get the starting error
-  means = rye.populationMeans(X = X, fam = fam, alpha = alpha, weight = weight, referenceGroups = referenceGroups)[pops, ]
+  means = rye.parameterizePopulationMeans(baseMeans, alpha, weight)[pops, ]
   predicted = rye.predict(X = X, means = means, weight = weight, referenceGroups = referenceGroups)
-  oldError = rye.absoluteError(expected = expected, predicted = predicted)
-  oldError = cbind(apply(oldError, 1, mean))
-  oldError = aggregate(oldError, by = list(fam[ , 'group']), mean)
-  oldError = oldError[ , -1]
-  oldError = mean(oldError)
+  oldError = predictionError(predicted)
   
   ## Return values
   minError = oldError
@@ -157,13 +224,12 @@ rye.gibbs = function(X = NULL, fam = NULL, referenceGroups = NULL,
     }
     
     ## Find the new errors
-    means = rye.populationMeans(X = X, fam = fam, alpha = newAlpha, weight = newWeight, referenceGroups = referenceGroups)[pops, ]
-    predicted = rye.predict(X = X, means = means, weight = newWeight, referenceGroups = referenceGroups)
-    newError = rye.absoluteError(expected = expected, predicted = predicted)
-    newError = cbind(apply(newError, 1, mean))
-    newError = aggregate(newError, by = list(fam[ , 'group']), mean)
-    newError = newError[ , -1]
-    newError = mean(newError)
+    means = rye.parameterizePopulationMeans(baseMeans, newAlpha, newWeight)[pops, ]
+    predicted = rye.predict(
+      X = X, means = means, weight = newWeight, referenceGroups = referenceGroups,
+      warmStart = predicted
+    )
+    newError = predictionError(predicted)
     
     ## Find the jump odds
     odds = pnorm(newError, mean = oldError, sd = oldError / 1000)
@@ -172,7 +238,7 @@ rye.gibbs = function(X = NULL, fam = NULL, referenceGroups = NULL,
     ## If this is the best error we've seen, then keep it
     if (newError < minError) {
       minError = newError
-      minParams = list(minError, alpha, weight, means, predicted)
+      minParams = list(minError, newAlpha, newWeight, means, predicted)
     }
     
     ## See if we jump
@@ -217,7 +283,7 @@ rye.optimize = function(X = NULL, fam = NULL,
   
   for (round in seq(rounds)) {
     
-    sd = startSD - (startSD - endSD) * log(round)/log(rounds)
+    sd = if (rounds == 1) startSD else startSD - (startSD - endSD) * log(round)/log(rounds)
     if (threads > 1) {
       params = mclapply(seq(attempts), function(i) rye.gibbs(X = referenceX, fam = referenceFAM, referenceGroups = referenceGroups,
                                                             iterations = iterations,
@@ -410,28 +476,29 @@ optionList = list(
               help = 'Number of attempts to find the optimum values (Default = 4)', metavar = '<ATTEMPTS>')
 )
 
-optParser = OptionParser(option_list = optionList)
-opt = parse_args(optParser)
-# Debug only
-# opt = parse_args(optParser, args = c("--eigenvec=extractedChrAllPrunedNoSan.25.eigenvec.gz",
-#                                      "--eigenval=extractedChrAllPrunedNoSan.25.eigenval",
-#                                      "--pop2group=pop2group.txt"))
-# print(opt)
-start_time <- Sys.time()
-logmsg("Parsing user supplied arguments...")
-validate_arguments(opt)
-logmsg("Arguments passed validation")
-logmsg(paste0("Running core rye with ", opt$threads, " threads"))
-rye(eigenvec_file = opt$eigenvec,
-    eigenval_file = opt$eigenval,
-    pop2group_file = opt$pop2group,
-    output_file = opt$output,
-    threads = opt$threads,
-    attempts = opt$attempts,
-    pcs = opt$pcs,
-    optim_rounds = opt$rounds,
-    optim_iter = opt$iter)
-logmsg("Process completed")
-end_time <- difftime(Sys.time(), start_time, units = "secs")[[1]]
-#print(end_time)
-logmsg(paste0("The process took ", pretty_time(end_time)))
+rye.main = function(args = commandArgs(trailingOnly = TRUE)) {
+  optParser = OptionParser(option_list = optionList)
+  opt = parse_args(optParser, args = args)
+  start_time <- Sys.time()
+  logmsg("Parsing user supplied arguments...")
+  validate_arguments(opt)
+  logmsg("Arguments passed validation")
+  solver = if (rye.nativeSolver) "Rust-accelerated" else "R/Fortran"
+  logmsg(paste0("Running core rye with ", opt$threads, " threads (", solver, " solver)"))
+  rye(eigenvec_file = opt$eigenvec,
+      eigenval_file = opt$eigenval,
+      pop2group_file = opt$pop2group,
+      output_file = opt$output,
+      threads = opt$threads,
+      attempts = opt$attempts,
+      pcs = opt$pcs,
+      optim_rounds = opt$rounds,
+      optim_iter = opt$iter)
+  logmsg("Process completed")
+  end_time <- difftime(Sys.time(), start_time, units = "secs")[[1]]
+  logmsg(paste0("The process took ", pretty_time(end_time)))
+}
+
+if (sys.nframe() == 0) {
+  rye.main()
+}

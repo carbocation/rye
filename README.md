@@ -14,7 +14,9 @@ We are working on improving the user experience with Rye.  This section will be 
 Rye requires the following OS/programs/modules to run:
 * Linux/Mac OS - tested on RedHat OS, expected to run on Mac environments, will possibly work on WSL and Windows; though Mac, WSL, and Windows haven't been tested so far
 * R - tested on several versions between 3.5.1 and 4.1.2
-* R libraries = nnls, Hmisc, parallel, optparse, and crayon
+* Rust toolchain (recommended) for the high-performance native solver
+* R libraries = optparse and crayon
+* The nnls R package is only required when using the compatibility fallback instead of the Rust solver
   
 #### git/R based installation
 This is a straightforward installation procedure with git and R:
@@ -29,25 +31,33 @@ conda install -c r r
 # Install R libraries
 # NOTE: If you maintain several environments, we recommend creating a dedicated environment for Rye, 
 # though its dependencies shouldn't conflict with other dependencies
-Rscript -e 'install.packages(c('nnls','Hmisc','parallel', 'optparse', 'crayon'))'
+Rscript -e 'install.packages(c("optparse", "crayon"))'
 
 # Download the repository
 git clone https://github.com/healthdisparities/rye
 
-# Ensure permissions are correct
 cd rye
-# the uploader (me) wasn't smart enough to change the permissions the first time and refuses to reupload the file with right permissions
-chmod +x rye.R
+
+# Build the single-thread-optimized Rust solver (no third-party Rust crates)
+cargo build --release
 
 # Check if the install happened correctly
 ./rye.R -h
 ```
 
+If Rust is unavailable, install `nnls` with `Rscript -e 'install.packages("nnls")'` and Rye will automatically use its R/Fortran compatibility path.
+
+### Single-thread performance
+
+The Rust solver batches all samples across one R/native boundary, reuses active sets between optimizer proposals, and removes repeated population aggregation from the inner loop. It does not create worker threads; `--threads=1` receives the full speedup.
+
+On the bundled 3,400-sample example, the one-thread quickstart workload (`--rounds=5 --iter=5 --attempts=4`) improved from 4.48 seconds to 0.39 seconds end-to-end on the development machine (11.5x). An isolated 500-proposal optimizer benchmark improved from 8.382 seconds on the compatibility solver to 0.212 seconds with Rust (39.5x), with a maximum prediction difference below `1.1e-11`.
+
 ## Quickstart guide
 Example files are provided to help user understand the input and test Rye easily.  If the environment is setup correctly, the user should be able to run the following command to run Rye:
 
 ```
-./rye.R --eigenvec=examples/example.eigenvec --eigenval=examples/example.eigenval --pop2group=examples/pop2group.txt --rounds=5 --threads=2 --iter=5 --out=out
+./rye.R --eigenvec=examples/example.eigenvec --eigenval=examples/example.eigenval --pop2group=examples/pop2group.txt --rounds=5 --threads=2 --iter=5 --output=out
 ```
 
 If the above command run successfully, the user should expect to see the following output on the screen:
