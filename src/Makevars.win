@@ -1,0 +1,11 @@
+OBJECTS = entrypoint.o
+RUST_STATIC_LIBRARY = ../target/release/librye.a
+PKG_LIBS = $(RUST_STATIC_LIBRARY)
+
+$(SHLIB): $(RUST_STATIC_LIBRARY)
+
+$(RUST_STATIC_LIBRARY):
+	cargo rustc --release --package rye-r --lib --crate-type staticlib
+
+clean:
+	rm -f $(OBJECTS) $(SHLIB)

@@ -1,0 +1,15 @@
+useDynLib(rye, .registration = TRUE)
+
+importFrom(stats, aggregate, coef, median, pnorm, rnorm, runif, setNames)
+importFrom(utils, read.table, write.table)
+
+export(rye)
+export(rye.absoluteError)
+export(rye.basePopulationMeans)
+export(rye.gibbs)
+export(rye.main)
+export(rye.optimize)
+export(rye.parameterizePopulationMeans)
+export(rye.populationMeans)
+export(rye.predict)
+export(rye.scale)

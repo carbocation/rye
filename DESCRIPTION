@@ -1,0 +1,32 @@
+Package: rye
+Type: Package
+Title: Rapid Ancestry Estimation
+Version: 0.1.0
+Authors@R: c(
+    person("Andrew", "Conley", role = c("aut", "cre"),
+           email = "aconley@ihrc.com"),
+    person("Lavanya", "Rishishwar", role = "aut"),
+    person("Shivam", "Sharma", role = "ctb"),
+    person("Emily", "Norris", role = "ctb"),
+    person("Maria", "Ahmad", role = "ctb")
+  )
+Description: Estimates global genetic ancestry from principal-component data
+    using non-negative least squares and a single-thread-optimized Rust core.
+    Independent optimization attempts can run in parallel while the numerical
+    core uses runtime-dispatched NEON, AVX2, or AVX-512 kernels.
+License: GPL (>= 3)
+URL: https://github.com/carbocation/rye
+BugReports: https://github.com/carbocation/rye/issues
+Encoding: UTF-8
+Imports:
+    crayon,
+    optparse,
+    parallel,
+    stats,
+    utils
+Suggests:
+    nnls,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+SystemRequirements: Cargo, Rust (>= 1.85)
+NeedsCompilation: yes

@@ -8,15 +8,49 @@ Developers and maintainers: Andrew Conley, Lavanya Rishishwar, Shivam Sharma
 Testers: Lavanya Rishishwar, Shivam Sharma, Emily Norris, Maria Ahmad
 
 ## Installation
-We are working on improving the user experience with Rye.  This section will be updated in near future with easier installation procedure for pastrami and it's dependencies.  
+
+### Install as an R package
+
+Rye can be installed directly from GitHub with `remotes`. The installer builds
+the bundled Rust accelerator and registers it as the package's native library.
+
+```r
+install.packages("remotes")
+remotes::install_github(
+    "carbocation/rye",
+    upgrade = "never",
+    force = TRUE
+)
+
+library(rye)
+```
+
+This requires R, a C compiler suitable for building R packages, and Rust 1.85
+or newer with Cargo. Install Rust from [rustup.rs](https://rustup.rs/) if
+`rustc --version` and `cargo --version` are not already available. The R
+dependencies `optparse` and `crayon` are installed through the normal package
+dependency mechanism.
+
+After installation, call the package API from R, for example
+`rye::rye.predict(...)`, or run the command-line entry point:
+
+```sh
+"$(Rscript -e 'cat(system.file("exec", "rye", package = "rye"))')" --help
+```
+
+The GitHub repository must be public, or your GitHub credentials must grant
+access to it. A 404 from `install_github()` before this package structure is
+pushed means GitHub cannot resolve or authorize `carbocation/rye`; it is not an
+R or Rust build failure.
 
 ### Dependencies
 Rye requires the following OS/programs/modules to run:
-* Linux/Mac OS - tested on RedHat OS, expected to run on Mac environments, will possibly work on WSL and Windows; though Mac, WSL, and Windows haven't been tested so far
-* R - tested on several versions between 3.5.1 and 4.1.2
-* Rust toolchain (recommended) for the high-performance native solver
-* R libraries = optparse and crayon
-* The nnls R package is only required when using the compatibility fallback instead of the Rust solver
+* Linux or macOS; Windows support is experimental
+* R
+* Rust 1.85 or newer and Cargo
+* R packages `optparse` and `crayon`
+* The `nnls` R package is only required when using the compatibility fallback
+  instead of the Rust solver
   
 #### git/R based installation
 This is a straightforward installation procedure with git and R:
@@ -34,11 +68,11 @@ conda install -c r r
 Rscript -e 'install.packages(c("optparse", "crayon"))'
 
 # Download the repository
-git clone https://github.com/healthdisparities/rye
+git clone https://github.com/carbocation/rye
 
 cd rye
 
-# Build the single-thread-optimized Rust solver
+# Build the single-thread-optimized Rust solver and R adapter
 # Cargo fetches the published rng-compat-r and its pinned libm dependency.
 cargo build --release
 

@@ -1,0 +1,10 @@
+^\.git$
+^\.github$
+^target$
+^Cargo\.toml\.orig$
+^examples$
+^logo$
+^tests/benchmark_native_optimizer\.R$
+^tests/verify_native_solver\.R$
+^rye_[0-9.]+\.tar\.gz$
+^rye\.Rcheck$

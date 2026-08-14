@@ -2,32 +2,72 @@ mod nnls;
 mod simd;
 
 use nnls::{BatchWorkspace, solve_nnls_batch};
-use rng_compat_r::{MathMode, RRng, pnorm_with_mode};
+pub use rng_compat_r::MathMode;
+use rng_compat_r::{RRng, pnorm_with_mode};
 use simd::{AxpyKernel, select_axpy, select_prediction_error};
-use std::ffi::{c_int, c_void};
+use std::fmt;
 use std::mem;
-use std::slice;
 
-type Sexp = *mut c_void;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreError {
+    InvalidDimensions(&'static str),
+    UnsupportedRandomSeed,
+}
 
-const INTSXP: c_int = 13;
-const REALSXP: c_int = 14;
-const VECSXP: c_int = 19;
+impl fmt::Display for CoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDimensions(message) => formatter.write_str(message),
+            Self::UnsupportedRandomSeed => formatter.write_str("unsupported R random seed"),
+        }
+    }
+}
 
-unsafe extern "C" {
-    static mut R_NilValue: Sexp;
+impl std::error::Error for CoreError {}
 
-    fn INTEGER(value: Sexp) -> *mut c_int;
-    fn Rf_allocMatrix(kind: c_int, rows: c_int, columns: c_int) -> Sexp;
-    fn Rf_allocVector(kind: c_int, length: isize) -> Sexp;
-    fn Rf_ncols(value: Sexp) -> c_int;
-    fn Rf_nrows(value: Sexp) -> c_int;
-    fn Rf_protect(value: Sexp) -> Sexp;
-    fn Rf_ScalarInteger(value: c_int) -> Sexp;
-    fn Rf_unprotect(count: c_int);
-    fn Rf_xlength(value: Sexp) -> isize;
-    fn REAL(value: Sexp) -> *mut f64;
-    fn SET_VECTOR_ELT(vector: Sexp, index: isize, value: Sexp);
+pub struct BatchNnlsInput<'a> {
+    /// Column-major sample-by-feature matrix.
+    pub x: &'a [f64],
+    /// Column-major group-by-feature matrix.
+    pub means: &'a [f64],
+    pub weights: &'a [f64],
+    /// Optional column-major sample-by-group warm start.
+    pub warm: &'a [f64],
+    pub samples: usize,
+    pub features: usize,
+    pub groups: usize,
+}
+
+pub struct GibbsInput<'a> {
+    /// Column-major sample-by-feature matrix.
+    pub x: &'a [f64],
+    /// Column-major group-by-feature matrix of unparameterized medians.
+    pub raw_means: &'a [f64],
+    pub alpha: &'a [f64],
+    pub weight: &'a [f64],
+    pub alpha_for_group: &'a [usize],
+    pub target_group: &'a [usize],
+    pub sample_weight: &'a [f64],
+    pub samples: usize,
+    pub features: usize,
+    pub groups: usize,
+    pub iterations: usize,
+    pub proposal_sd: f64,
+    pub optimize_alpha: bool,
+    pub optimize_weight: bool,
+    pub math_mode: MathMode,
+    pub random_seed: &'a [i32],
+}
+
+pub struct GibbsResult {
+    pub best_error: f64,
+    pub alpha: Vec<f64>,
+    pub weight: Vec<f64>,
+    /// Row-major group-by-feature basis.
+    pub basis: Vec<f64>,
+    /// Column-major sample-by-group normalized coefficients.
+    pub coefficients: Vec<f64>,
+    pub random_seed: Vec<i32>,
 }
 
 #[inline]
@@ -138,83 +178,35 @@ fn update_rhs(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn solve_all(
-    gram: &[f64],
-    rhs: &[f64],
-    warm: &[f64],
-    warm_masks: Option<&[u64]>,
-    samples: usize,
-    groups: usize,
-    output: &mut [f64],
-    output_masks: &mut [u64],
-    workspace: &mut BatchWorkspace,
-) {
-    solve_nnls_batch(
-        gram,
-        rhs,
-        warm,
-        warm_masks,
-        samples,
-        groups,
-        output,
-        output_masks,
-        workspace,
-    );
-}
-
-fn copy_normalized(coefficients: &[f64], samples: usize, groups: usize, output: &mut [f64]) {
-    for sample in 0..samples {
-        let mut total = 0.0;
-        for group in 0..groups {
-            total += coefficients[group * samples + sample];
-        }
-        for group in 0..groups {
-            output[group * samples + sample] = coefficients[group * samples + sample] / total;
-        }
+fn validate_batch(input: &BatchNnlsInput<'_>) -> Result<(), CoreError> {
+    if input.samples == 0 || input.features == 0 || input.groups == 0 || input.groups > 63 {
+        return Err(CoreError::InvalidDimensions(
+            "NNLS dimensions must be nonzero and groups must not exceed 63",
+        ));
     }
+    if input.x.len() != input.samples * input.features
+        || input.means.len() != input.groups * input.features
+        || input.weights.len() != input.features
+        || (!input.warm.is_empty() && input.warm.len() != input.samples * input.groups)
+    {
+        return Err(CoreError::InvalidDimensions(
+            "NNLS input slices do not match their declared dimensions",
+        ));
+    }
+    Ok(())
 }
 
-/// Return the selected SIMD kernel: scalar=0, NEON=1, AVX2=2, AVX-512=3.
-#[unsafe(no_mangle)]
-pub extern "C" fn rye_simd_level() -> Sexp {
-    unsafe { Rf_ScalarInteger(simd::kernel_level()) }
-}
-
-/// Return the native optimizer ABI version expected by the R wrapper.
-#[unsafe(no_mangle)]
-pub extern "C" fn rye_optimizer_abi() -> Sexp {
-    unsafe { Rf_ScalarInteger(2) }
-}
-
-/// Solve all rows of X against the same ancestry basis in one R-to-native call.
-///
-/// # Safety
-///
-/// R must pass double matrices for `x`, `means`, and `warm`, plus a double
-/// vector for `weights`. The R wrapper validates matching dimensions.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rye_nnls_batch(
-    x_sexp: Sexp,
-    means_sexp: Sexp,
-    weights_sexp: Sexp,
-    warm_sexp: Sexp,
-) -> Sexp {
-    let samples = unsafe { Rf_nrows(x_sexp) as usize };
-    let features = unsafe { Rf_ncols(x_sexp) as usize };
-    let groups = unsafe { Rf_nrows(means_sexp) as usize };
-    let warm_rows = unsafe { Rf_nrows(warm_sexp) as usize };
-    let warm_columns = unsafe { Rf_ncols(warm_sexp) as usize };
-    let x = unsafe { slice::from_raw_parts(REAL(x_sexp), samples * features) };
-    let means = unsafe { slice::from_raw_parts(REAL(means_sexp), groups * features) };
-    let weights = unsafe { slice::from_raw_parts(REAL(weights_sexp), features) };
-    let warm = if warm_rows == samples && warm_columns == groups {
-        unsafe { slice::from_raw_parts(REAL(warm_sexp), samples * groups) }
-    } else {
-        &[]
-    };
-    let answer = unsafe { Rf_protect(Rf_allocMatrix(REALSXP, samples as c_int, groups as c_int)) };
-    let result = unsafe { slice::from_raw_parts_mut(REAL(answer), samples * groups) };
+pub fn solve_batch(input: BatchNnlsInput<'_>) -> Result<Vec<f64>, CoreError> {
+    validate_batch(&input)?;
+    let BatchNnlsInput {
+        x,
+        means,
+        weights,
+        warm,
+        samples,
+        features,
+        groups,
+    } = input;
     let mut basis = vec![0.0; groups * features];
     for group in 0..groups {
         for feature in 0..features {
@@ -235,75 +227,77 @@ pub unsafe extern "C" fn rye_nnls_batch(
         select_axpy(),
     );
     let zero_warm = vec![0.0; samples * groups];
+    let mut result = vec![0.0; samples * groups];
     let mut output_masks = vec![0_u64; samples];
-    solve_all(
+    solve_nnls_batch(
         &gram,
         &rhs,
         if warm.is_empty() { &zero_warm } else { warm },
         None,
         samples,
         groups,
-        result,
+        &mut result,
         &mut output_masks,
         &mut BatchWorkspace::new(groups, samples),
     );
-    unsafe { Rf_unprotect(1) };
-    answer
+    Ok(result)
 }
 
-/// Run one complete Gibbs optimization attempt with persistent native state.
-///
-/// # Safety
-///
-/// R must pass dimensionally compatible double matrices/vectors and an integer
-/// `.Random.seed`. The wrapper validates dimensions, group indices, RNG type,
-/// and the 63-group active-mask limit.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rye_gibbs_native_v2(
-    x_sexp: Sexp,
-    raw_means_sexp: Sexp,
-    alpha_sexp: Sexp,
-    weight_sexp: Sexp,
-    alpha_for_group_sexp: Sexp,
-    target_group_sexp: Sexp,
-    sample_weight_sexp: Sexp,
-    controls_sexp: Sexp,
-    seed_sexp: Sexp,
-) -> Sexp {
-    let samples = unsafe { Rf_nrows(x_sexp) as usize };
-    let features = unsafe { Rf_ncols(x_sexp) as usize };
-    let groups = unsafe { Rf_nrows(raw_means_sexp) as usize };
-    let x = unsafe { slice::from_raw_parts(REAL(x_sexp), samples * features) };
-    let raw_means = unsafe { slice::from_raw_parts(REAL(raw_means_sexp), groups * features) };
-    let alpha_input = unsafe { slice::from_raw_parts(REAL(alpha_sexp), groups) };
-    let weight_input = unsafe { slice::from_raw_parts(REAL(weight_sexp), features) };
-    let alpha_for_group_input =
-        unsafe { slice::from_raw_parts(REAL(alpha_for_group_sexp), groups) };
-    let target_group_input = unsafe { slice::from_raw_parts(REAL(target_group_sexp), samples) };
-    let sample_weight = unsafe { slice::from_raw_parts(REAL(sample_weight_sexp), samples) };
-    let controls = unsafe { slice::from_raw_parts(REAL(controls_sexp), 5) };
-    let iterations = controls[0] as usize;
-    let proposal_sd = controls[1];
-    let optimize_alpha = controls[2] != 0.0;
-    let optimize_weight = controls[3] != 0.0;
-    let math_mode = if controls[4] != 0.0 {
-        MathMode::Deterministic
-    } else {
-        MathMode::Platform
-    };
-    let seed_length = unsafe { Rf_xlength(seed_sexp) };
-    if seed_length <= 0 {
-        return unsafe { R_NilValue };
+fn validate_gibbs(input: &GibbsInput<'_>) -> Result<(), CoreError> {
+    if input.samples == 0 || input.features == 0 || input.groups == 0 || input.groups > 63 {
+        return Err(CoreError::InvalidDimensions(
+            "Gibbs dimensions must be nonzero and groups must not exceed 63",
+        ));
     }
-    let seed = unsafe { slice::from_raw_parts(INTEGER(seed_sexp), seed_length as usize) };
-    let Ok(mut rng) = RRng::from_random_seed(seed) else {
-        return unsafe { R_NilValue };
-    };
+    if input.x.len() != input.samples * input.features
+        || input.raw_means.len() != input.groups * input.features
+        || input.alpha.len() != input.groups
+        || input.weight.len() != input.features
+        || input.alpha_for_group.len() != input.groups
+        || input.target_group.len() != input.samples
+        || input.sample_weight.len() != input.samples
+        || input
+            .alpha_for_group
+            .iter()
+            .any(|&index| index >= input.groups)
+        || input
+            .target_group
+            .iter()
+            .any(|&index| index >= input.groups)
+    {
+        return Err(CoreError::InvalidDimensions(
+            "Gibbs input slices or indices do not match their declared dimensions",
+        ));
+    }
+    if input.random_seed.is_empty() {
+        return Err(CoreError::UnsupportedRandomSeed);
+    }
+    Ok(())
+}
+
+pub fn optimize_gibbs(input: GibbsInput<'_>) -> Result<GibbsResult, CoreError> {
+    validate_gibbs(&input)?;
+    let GibbsInput {
+        x,
+        raw_means,
+        alpha,
+        weight,
+        alpha_for_group,
+        target_group,
+        sample_weight,
+        samples,
+        features,
+        groups,
+        iterations,
+        proposal_sd,
+        optimize_alpha,
+        optimize_weight,
+        math_mode,
+        random_seed,
+    } = input;
+    let mut rng =
+        RRng::from_random_seed(random_seed).map_err(|_| CoreError::UnsupportedRandomSeed)?;
     rng.set_math_mode(math_mode);
-    let alpha_for_group: Vec<usize> = alpha_for_group_input
-        .iter()
-        .map(|&value| value as usize)
-        .collect();
     let group_for_alpha: Vec<usize> = (0..groups)
         .map(|alpha_index| {
             alpha_for_group
@@ -312,15 +306,11 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
                 .unwrap_or(alpha_index)
         })
         .collect();
-    let target_group: Vec<usize> = target_group_input
-        .iter()
-        .map(|&value| value as usize)
-        .collect();
     let axpy = select_axpy();
     let prediction_error = select_prediction_error();
 
-    let mut current_alpha = alpha_input.to_vec();
-    let mut current_weight = weight_input.to_vec();
+    let mut current_alpha = alpha.to_vec();
+    let mut current_weight = weight.to_vec();
     let mut current_basis = vec![0.0; groups * features];
     let mut current_gram = vec![0.0; groups * groups];
     let mut current_rhs = vec![0.0; samples * groups];
@@ -329,7 +319,7 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
         raw_means,
         &current_alpha,
         &current_weight,
-        &alpha_for_group,
+        alpha_for_group,
         groups,
         features,
         &mut current_basis,
@@ -348,7 +338,7 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
     let mut workspace = BatchWorkspace::new(groups, samples);
     let zero_warm = vec![0.0; samples * groups];
     let mut current_masks = vec![0_u64; samples];
-    solve_all(
+    solve_nnls_batch(
         &current_gram,
         &current_rhs,
         &zero_warm,
@@ -361,7 +351,7 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
     );
     let mut current_error = prediction_error(
         &current_coefficients,
-        &target_group,
+        target_group,
         sample_weight,
         samples,
         groups,
@@ -444,7 +434,7 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
             axpy,
         );
         build_gram(&proposal_basis, groups, features, &mut proposal_gram);
-        solve_all(
+        solve_nnls_batch(
             &proposal_gram,
             &proposal_rhs,
             &current_coefficients,
@@ -457,7 +447,7 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
         );
         let proposal_error = prediction_error(
             &proposal_coefficients,
-            &target_group,
+            target_group,
             sample_weight,
             samples,
             groups,
@@ -498,36 +488,31 @@ pub unsafe extern "C" fn rye_gibbs_native_v2(
         }
     }
 
-    let result_length = 1 + groups + features + groups * features + samples * groups;
-    let answer = unsafe { Rf_protect(Rf_allocVector(VECSXP, 2)) };
-    let optimizer_result = unsafe { Rf_protect(Rf_allocVector(REALSXP, result_length as isize)) };
-    let result = unsafe { slice::from_raw_parts_mut(REAL(optimizer_result), result_length) };
-    let mut offset = 0;
-    result[offset] = best_error;
-    offset += 1;
-    result[offset..offset + groups].copy_from_slice(&best_alpha);
-    offset += groups;
-    result[offset..offset + features].copy_from_slice(&best_weight);
-    offset += features;
-    for feature in 0..features {
+    let mut normalized_coefficients = vec![0.0; samples * groups];
+    for sample in 0..samples {
+        let mut total = 0.0;
         for group in 0..groups {
-            result[offset + group + feature * groups] = best_basis[group * features + feature];
+            total += best_coefficients[group * samples + sample];
+        }
+        for group in 0..groups {
+            normalized_coefficients[group * samples + sample] =
+                best_coefficients[group * samples + sample] / total;
         }
     }
-    offset += groups * features;
-    copy_normalized(&best_coefficients, samples, groups, &mut result[offset..]);
+    let mut next_seed = vec![0_i32; rng.random_seed_len()];
+    rng.write_random_seed(&mut next_seed)
+        .map_err(|_| CoreError::UnsupportedRandomSeed)?;
+    Ok(GibbsResult {
+        best_error,
+        alpha: best_alpha,
+        weight: best_weight,
+        basis: best_basis,
+        coefficients: normalized_coefficients,
+        random_seed: next_seed,
+    })
+}
 
-    let seed_length = rng.random_seed_len();
-    let seed_result = unsafe { Rf_protect(Rf_allocVector(INTSXP, seed_length as isize)) };
-    let seed_output = unsafe { slice::from_raw_parts_mut(INTEGER(seed_result), seed_length) };
-    if rng.write_random_seed(seed_output).is_err() {
-        unsafe { Rf_unprotect(3) };
-        return unsafe { R_NilValue };
-    }
-    unsafe {
-        SET_VECTOR_ELT(answer, 0, optimizer_result);
-        SET_VECTOR_ELT(answer, 1, seed_result);
-        Rf_unprotect(3);
-    }
-    answer
+/// Selected SIMD kernel: scalar=0, NEON=1, AVX2=2, AVX-512=3.
+pub fn simd_level() -> i32 {
+    simd::kernel_level()
 }

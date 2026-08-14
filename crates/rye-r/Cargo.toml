@@ -1,0 +1,13 @@
+[package]
+name = "rye-r"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "rye"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+rye-core = { path = "../rye-core" }

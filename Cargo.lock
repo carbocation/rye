@@ -23,3 +23,10 @@ version = "0.1.0"
 dependencies = [
  "rng-compat-r",
 ]
+
+[[package]]
+name = "rye-r"
+version = "0.1.0"
+dependencies = [
+ "rye-core",
+]

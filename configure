@@ -1,0 +1,29 @@
+#!/bin/sh
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "error: Rye requires Cargo and Rust 1.85 or newer" >&2
+  echo "Install Rust from https://rustup.rs and retry R CMD INSTALL." >&2
+  exit 1
+fi
+
+rust_version=$(rustc --version 2>/dev/null | awk '{print $2}')
+if test -z "$rust_version"; then
+  echo "error: rustc is unavailable; install Rust 1.85 or newer" >&2
+  exit 1
+fi
+
+rust_major=${rust_version%%.*}
+rust_remainder=${rust_version#*.}
+rust_minor=${rust_remainder%%.*}
+case "$rust_major.$rust_minor" in
+  *[!0-9.]*|.*|*.)
+    echo "error: unable to parse rustc version: $rust_version" >&2
+    exit 1
+    ;;
+esac
+if test "$rust_major" -lt 1 || { test "$rust_major" -eq 1 && test "$rust_minor" -lt 85; }; then
+  echo "error: Rye requires Rust 1.85 or newer; found $rust_version" >&2
+  exit 1
+fi
+
+exit 0
